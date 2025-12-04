@@ -15,7 +15,7 @@
 
 ### 快速安装
 ```
-wget -N --no-check-certificate "https://raw.githubusercontent.com/Joseph-ink/XRAY-XHTTP/main/install.sh" && chmod +x install.sh && ./install.sh  
+wget -N --no-check-certificate "https://raw.githubusercontent.com/Joseph-ink/XRAY-XHTTP/refs/heads/main/install.sh" && chmod +x install.sh && ./install.sh  
 ```
 
 
