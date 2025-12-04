@@ -27,6 +27,6 @@ wget -N --no-check-certificate "https://raw.githubusercontent.com/Joseph-ink/XRA
 | Xray配置 | **/usr/local/etc/xray/config.json** |
 | TLS证书 | **/etc/ssl/xray/** |  
 
-### 免责生命
+### 免责声明
 本项目脚本使用Claude Code自动编写，处于非常早期阶段，目的主要在于自用。
-使用一键脚本前请审核代码确认安全，若存在Bug请PR修复，使用时请遵守当地法律。
+使用脚本前，请审核代码确认安全，若存在Bug请PR修复，使用时请遵守当地法律。
