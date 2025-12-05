@@ -852,9 +852,18 @@ EOF
     
     # 创建日志目录
     mkdir -p /var/log/xray
-    
+
+    # 保存配置信息到临时文件（安装时使用）
     echo "$uuid" > /tmp/xray_uuid.txt
-    
+
+    # 持久化保存配置信息（供后续查询使用）
+    cat > /usr/local/etc/xray/install_info.conf << INFO_EOF
+# Xray 安装信息
+# 生成时间: $(date)
+UUID=$uuid
+PATH=$path
+INFO_EOF
+
     print_success "Xray配置完成"
 }
 
@@ -959,19 +968,77 @@ full_install() {
 
 # 显示代理信息
 show_proxy_info() {
-    if [[ ! -f /tmp/xray_uuid.txt ]] || [[ ! -f /tmp/xray_path.txt ]]; then
-        print_error "未找到配置信息，请先完成安装"
+    local uuid=""
+    local path=""
+    local domains_input=""
+
+    # 优先级1: 从临时文件读取（安装后立即显示）
+    if [[ -f /tmp/xray_uuid.txt ]]; then
+        uuid=$(cat /tmp/xray_uuid.txt)
+    fi
+    if [[ -f /tmp/xray_path.txt ]]; then
+        path=$(cat /tmp/xray_path.txt)
+    fi
+
+    # 优先级2: 从持久化配置文件读取
+    if [[ -z "$uuid" ]] || [[ -z "$path" ]]; then
+        if [[ -f /usr/local/etc/xray/install_info.conf ]]; then
+            print_info "从持久化配置读取信息..."
+            source /usr/local/etc/xray/install_info.conf
+            uuid=${UUID:-$uuid}
+            path=${PATH:-$path}
+        fi
+    fi
+
+    # 优先级3: 从Xray配置文件提取（最可靠）
+    if [[ -f $XRAY_CONF ]]; then
+        if [[ -z "$uuid" ]]; then
+            print_info "从Xray配置文件读取UUID..."
+            # 使用sed提取，更可靠
+            uuid=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' $XRAY_CONF | head -n 1)
+        fi
+
+        if [[ -z "$path" ]]; then
+            print_info "从Xray配置文件读取路径..."
+            # xhttpSettings中的path字段
+            path=$(sed -n 's/.*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' $XRAY_CONF | head -n 1)
+        fi
+    fi
+
+    # 如果仍然无法获取信息
+    if [[ -z "$uuid" ]] || [[ -z "$path" ]]; then
+        print_error "未找到配置信息"
+        echo ""
+        print_warning "配置文件状态："
+
+        if [[ -f $XRAY_CONF ]]; then
+            echo "  ✓ Xray配置文件存在: $XRAY_CONF"
+            echo "    尝试手动提取UUID:"
+            grep -E '"id"' $XRAY_CONF | head -n 1 || echo "    未找到id字段"
+            echo "    尝试手动提取Path:"
+            grep -E '"path"' $XRAY_CONF | head -n 1 || echo "    未找到path字段"
+        else
+            echo "  ✗ Xray配置文件不存在: $XRAY_CONF"
+        fi
+
+        if [[ -f $NGINX_CONF ]]; then
+            echo "  ✓ Nginx配置文件存在: $NGINX_CONF"
+        else
+            echo "  ✗ Nginx配置文件不存在: $NGINX_CONF"
+        fi
+
+        echo ""
+        print_warning "请检查配置文件格式是否正确，或重新运行完整安装"
         return
     fi
-    
-    local uuid=$(cat /tmp/xray_uuid.txt)
-    local path=$(cat /tmp/xray_path.txt)
-    local domains_input
-    
+
+    # 获取域名信息
     if [[ -f $NGINX_CONF ]]; then
         domains_input=$(grep -oP 'server_name \K[^;]+' $NGINX_CONF | grep -v '_' | head -n 1)
-    else
-        read -p "请输入域名: " domains_input
+    fi
+
+    if [[ -z "$domains_input" ]]; then
+        domains_input="<未配置域名>"
     fi
     
     echo ""
@@ -1019,6 +1086,8 @@ partial_uninstall() {
     rm -rf /var/www/html
     rm -rf /var/cache/nginx
     rm -f /tmp/xray_*.txt
+    rm -rf /usr/local/etc/xray
+    rm -rf /var/log/xray
 
     # 删除nginx可执行文件（编译安装）
     rm -f /usr/sbin/nginx
