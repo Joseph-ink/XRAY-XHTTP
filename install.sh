@@ -1070,7 +1070,7 @@ NGINX_CONF_MIDDLE
         
         # QUIC 支持
         add_header Alt-Svc 'h3=":443"; ma=86400';
-        add_header X-QUIC-Status $http3;
+        add_header X-QUIC-Status \$http3;
         server_name $domain;
         
         root /var/www/html;
