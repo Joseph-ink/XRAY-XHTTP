@@ -683,6 +683,7 @@ compile_install_nginx() {
         --with-file-aio \
         --with-http_ssl_module \
         --with-http_v2_module \
+        --with-http_v3_module \
         --with-http_realip_module \
         --with-http_addition_module \
         --with-http_xslt_module=dynamic \
@@ -1063,7 +1064,13 @@ NGINX_CONF_MIDDLE
     server {
         listen 443 ssl;
         listen [::]:443 ssl;
+        listen 443 quic reuseport;
+        listen [::]:443 quic reuseport;
         http2 on;
+        
+        # QUIC 支持
+        add_header Alt-Svc 'h3=":443"; ma=86400';
+        add_header X-QUIC-Status $http3;
         server_name $domain;
         
         root /var/www/html;
