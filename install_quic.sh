@@ -1,8 +1,7 @@
 #!/bin/bash
 
-# Nginx + Xray 自动化部署脚本 (支持 HTTP/3 和 QUIC)
+# Nginx + Xray 自动化部署脚本
 # 支持多域名SNI分流和自动TLS证书管理
-# HTTP/3通过QUIC协议提供更快的连接建立和更好的网络性能
 
 set -e
 
@@ -65,40 +64,32 @@ create_directories() {
 select_nginx_install_method() {
     echo ""
     echo -e "${GREEN}请选择Nginx安装方式:${NC}"
-    echo "1) 软件源安装 (快速，约1-2分钟) - 不支持HTTP/3"
-    echo "2) 源码编译安装 (高性能，支持HTTP/3，约10-20分钟，根据CPU性能)"
+    echo "1) 软件源安装 (快速，约1-2分钟)"
+    echo "2) 源码编译安装 (高性能，约5-15分钟，根据CPU性能)"
     echo ""
-    print_warning "注意: HTTP/3和QUIC支持需要源码编译安装(选项2)"
-    echo ""
-    read -p "请选择 [1-2，默认2]: " nginx_method_choice
+    read -p "请选择 [1-2，默认1]: " nginx_method_choice
 
-    case ${nginx_method_choice:-2} in
+    case ${nginx_method_choice:-1} in
         1)
             NGINX_INSTALL_METHOD="package"
             print_info "已选择: 软件源安装"
-            print_warning "软件源安装不支持HTTP/3，如需HTTP/3请选择编译安装"
             ;;
         2)
             NGINX_INSTALL_METHOD="compile"
-            print_info "已选择: 源码编译安装（静态编译，优化性能，支持HTTP/3和QUIC）"
+            print_info "已选择: 源码编译安装（静态编译，优化性能）"
             ;;
         *)
-            NGINX_INSTALL_METHOD="compile"
-            print_info "已选择: 源码编译安装（静态编译，优化性能，支持HTTP/3和QUIC）"
+            NGINX_INSTALL_METHOD="package"
+            print_info "已选择: 软件源安装"
             ;;
     esac
 }
 
-# 检测CPU架构并生成编译优化参数（增强版）
-# 支持：x86-64 (v1/v2/v3/v4), ARM64 (各种微架构), ARMv7
-# 特点：针对具体CPU型号优化，而非通用generic
+# 检测CPU架构并生成编译优化参数
 detect_cpu_optimization() {
     local arch=$(uname -m)
+    local os=$(uname -s)
     local cc_opt=""
-    local cpu_info=""
-    local detected_tune=""
-    local detected_march=""
-    local extra_flags=""
 
     # 基础优化参数（适用于所有架构）
     cc_opt="-g0 -O3 -fstack-reuse=all -fdwarf2-cfi-asm -fplt -fno-trapv -fno-exceptions"
@@ -106,421 +97,30 @@ detect_cpu_optimization() {
     cc_opt="$cc_opt -fno-stack-clash-protection -fno-stack-protector -fcf-protection=none"
     cc_opt="$cc_opt -fno-split-stack -fno-sanitize=all -fno-instrument-functions"
 
-    # 通用性能优化（所有架构）
-    # -fomit-frame-pointer: 释放一个寄存器用于其他用途
-    # -fmerge-all-constants: 合并所有常量（包括浮点）
-    # -fno-math-errno: 不设置errno（数学函数更快）
-    # -fno-trapping-math: 假设浮点运算不会trap
-    # -ffunction-sections -fdata-sections: 配合链接器--gc-sections移除未使用代码
-    extra_flags="-fomit-frame-pointer -fmerge-all-constants -fno-math-errno -fno-trapping-math"
-    extra_flags="$extra_flags -ffunction-sections -fdata-sections"
-
+    # 根据架构添加特定优化
     case $arch in
         x86_64)
-            # 读取CPU信息
-            cpu_info=$(cat /proc/cpuinfo 2>/dev/null)
-            local model_name=$(echo "$cpu_info" | grep -m1 "model name" | cut -d: -f2 | xargs)
-            local vendor=$(echo "$cpu_info" | grep -m1 "vendor_id" | cut -d: -f2 | xargs)
-            local cpu_family=$(echo "$cpu_info" | grep -m1 "cpu family" | cut -d: -f2 | xargs)
-            local model=$(echo "$cpu_info" | grep -m1 "^model" | grep -v "model name" | cut -d: -f2 | xargs)
-
-            # ========== 检测 x86-64 微架构级别 ==========
-            # x86-64-v4: AVX-512F + AVX-512BW + AVX-512CD + AVX-512DQ + AVX-512VL
-            # x86-64-v3: AVX + AVX2 + BMI1 + BMI2 + F16C + FMA + LZCNT + MOVBE + XSAVE
-            # x86-64-v2: CMPXCHG16B + LAHF-SAHF + POPCNT + SSE3 + SSE4.1 + SSE4.2 + SSSE3
-            # x86-64-v1: 基础 x86-64（SSE、SSE2）
-
-            local has_avx512=false
-            local has_avx2=false
-            local has_sse4=false
-
-            # 检测 AVX-512（v4级别）- 需要多个AVX-512子集
-            if echo "$cpu_info" | grep -q "avx512f" && \
-               echo "$cpu_info" | grep -q "avx512bw" && \
-               echo "$cpu_info" | grep -q "avx512cd" && \
-               echo "$cpu_info" | grep -q "avx512dq" && \
-               echo "$cpu_info" | grep -q "avx512vl"; then
-                has_avx512=true
-            fi
-
-            # 检测 AVX2（v3级别）
-            if echo "$cpu_info" | grep -q "avx2"; then
-                has_avx2=true
-            fi
-
-            # 检测 SSE4（v2级别）
-            if echo "$cpu_info" | grep -q "sse4_2"; then
-                has_sse4=true
-            fi
-
-            # ========== 确定 -march 级别 ==========
-            if $has_avx512; then
-                detected_march="x86-64-v4"
-            elif $has_avx2; then
-                detected_march="x86-64-v3"
-            elif $has_sse4; then
-                detected_march="x86-64-v2"
+            # 检测是否支持更高级的指令集
+            if grep -q "avx2" /proc/cpuinfo 2>/dev/null; then
+                cc_opt="$cc_opt -march=x86-64-v3 -mtune=generic"
+            elif grep -q "sse4" /proc/cpuinfo 2>/dev/null; then
+                cc_opt="$cc_opt -march=x86-64-v2 -mtune=generic"
             else
-                detected_march="x86-64"
-            fi
-
-            # ========== 针对具体CPU型号确定 -mtune ==========
-            # Intel CPU 检测
-            if [[ "$vendor" == "GenuineIntel" ]]; then
-                case "$cpu_family-$model" in
-                    # Sapphire Rapids / Emerald Rapids (4th/5th Gen Xeon Scalable)
-                    6-143|6-207)
-                        detected_tune="sapphirerapids"
-                        ;;
-                    # Ice Lake Server (3rd Gen Xeon Scalable)
-                    6-106|6-108)
-                        detected_tune="icelake-server"
-                        ;;
-                    # Skylake-X / Cascade Lake / Cooper Lake
-                    6-85)
-                        detected_tune="skylake-avx512"
-                        ;;
-                    # Rocket Lake (11th Gen Desktop)
-                    6-167)
-                        detected_tune="rocketlake"
-                        ;;
-                    # Alder Lake / Raptor Lake (12th/13th/14th Gen)
-                    6-151|6-154|6-183|6-186|6-191|6-190)
-                        detected_tune="alderlake"
-                        ;;
-                    # Tiger Lake (11th Gen Mobile)
-                    6-140|6-141)
-                        detected_tune="tigerlake"
-                        ;;
-                    # Ice Lake Client (10th Gen Mobile)
-                    6-125|6-126)
-                        detected_tune="icelake-client"
-                        ;;
-                    # Skylake / Kaby Lake / Coffee Lake / Comet Lake
-                    6-78|6-94|6-142|6-158|6-165|6-166)
-                        detected_tune="skylake"
-                        ;;
-                    # Broadwell
-                    6-61|6-71|6-79|6-86)
-                        detected_tune="broadwell"
-                        ;;
-                    # Haswell
-                    6-60|6-63|6-69|6-70)
-                        detected_tune="haswell"
-                        ;;
-                    # Sandy Bridge / Ivy Bridge
-                    6-42|6-45|6-58|6-62)
-                        detected_tune="sandybridge"
-                        ;;
-                    *)
-                        # 根据指令集推断
-                        if $has_avx512; then
-                            detected_tune="skylake-avx512"
-                        elif $has_avx2; then
-                            detected_tune="haswell"
-                        else
-                            detected_tune="generic"
-                        fi
-                        ;;
-                esac
-            # AMD CPU 检测
-            elif [[ "$vendor" == "AuthenticAMD" ]]; then
-                case "$cpu_family-$model" in
-                    # Zen 5 (Granite Ridge / Turin)
-                    26-*)
-                        detected_tune="znver5"
-                        ;;
-                    # Zen 4 (Ryzen 7000 / EPYC Genoa)
-                    25-97|25-24|25-17)
-                        detected_tune="znver4"
-                        ;;
-                    # Zen 3 (Ryzen 5000 / EPYC Milan)
-                    25-1|25-33|25-80|25-8|25-68|25-44|25-50|25-56)
-                        detected_tune="znver3"
-                        ;;
-                    # Zen 2 (Ryzen 3000 / EPYC Rome)
-                    23-49|23-71|23-96|23-113|23-104|23-144)
-                        detected_tune="znver2"
-                        ;;
-                    # Zen / Zen+ (Ryzen 1000/2000)
-                    23-*)
-                        detected_tune="znver1"
-                        ;;
-                    # Bulldozer family
-                    21-*)
-                        detected_tune="bdver4"
-                        ;;
-                    *)
-                        if $has_avx512; then
-                            detected_tune="znver4"
-                        elif $has_avx2; then
-                            detected_tune="znver2"
-                        else
-                            detected_tune="generic"
-                        fi
-                        ;;
-                esac
-            else
-                # 其他/虚拟化环境
-                detected_tune="generic"
-            fi
-
-            # 组合最终的 x86_64 编译参数
-            cc_opt="$cc_opt -march=$detected_march -mtune=$detected_tune"
-            cc_opt="$cc_opt $extra_flags"
-
-            # x86_64 特有优化：避免AVX/SSE转换开销
-            if $has_avx2 || $has_avx512; then
-                cc_opt="$cc_opt -mno-vzeroupper"
+                cc_opt="$cc_opt -march=x86-64 -mtune=generic"
             fi
             ;;
-
         aarch64|arm64)
-            # ARM64 CPU 检测
-            local implementer=""
-            local part=""
-
-            if [[ -f /proc/cpuinfo ]]; then
-                implementer=$(grep -m1 "CPU implementer" /proc/cpuinfo | cut -d: -f2 | xargs)
-                part=$(grep -m1 "CPU part" /proc/cpuinfo | cut -d: -f2 | xargs)
-            fi
-
-            # macOS/Darwin 检测（Asahi Linux或交叉编译场景）
-            if [[ "$(uname -s)" == "Darwin" ]]; then
-                local brand=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "")
-                if echo "$brand" | grep -q "Apple"; then
-                    if echo "$brand" | grep -qE "M[34]"; then
-                        detected_march="armv8.5-a+crc+crypto+sha3+sm4+fp16+bf16+i8mm+dotprod"
-                        detected_tune="apple-m3"
-                    elif echo "$brand" | grep -q "M2"; then
-                        detected_march="armv8.5-a+crc+crypto+sha3+fp16+bf16+i8mm+dotprod"
-                        detected_tune="apple-m2"
-                    else
-                        detected_march="armv8.5-a+crc+crypto+sha3+fp16"
-                        detected_tune="apple-m1"
-                    fi
-                    cc_opt="$cc_opt -march=$detected_march -mtune=$detected_tune $extra_flags"
-                    echo "$cc_opt"
-                    return
-                fi
-            fi
-
-            # Linux ARM64 检测
-            case "$implementer" in
-                0x41)  # ARM Ltd
-                    case "$part" in
-                        0xd03)  # Cortex-A53
-                            detected_march="armv8-a+crc+crypto"
-                            detected_tune="cortex-a53"
-                            ;;
-                        0xd05)  # Cortex-A55
-                            detected_march="armv8.2-a+crc+crypto+dotprod"
-                            detected_tune="cortex-a55"
-                            ;;
-                        0xd07)  # Cortex-A57
-                            detected_march="armv8-a+crc+crypto"
-                            detected_tune="cortex-a57"
-                            ;;
-                        0xd08)  # Cortex-A72
-                            detected_march="armv8-a+crc+crypto"
-                            detected_tune="cortex-a72"
-                            ;;
-                        0xd09)  # Cortex-A73
-                            detected_march="armv8-a+crc+crypto"
-                            detected_tune="cortex-a73"
-                            ;;
-                        0xd0a)  # Cortex-A75
-                            detected_march="armv8.2-a+crc+crypto+dotprod+fp16"
-                            detected_tune="cortex-a75"
-                            ;;
-                        0xd0b)  # Cortex-A76
-                            detected_march="armv8.2-a+crc+crypto+dotprod+fp16"
-                            detected_tune="cortex-a76"
-                            ;;
-                        0xd0c)  # Neoverse N1 (AWS Graviton2, Ampere Altra, Oracle A1)
-                            detected_march="armv8.2-a+crc+crypto+dotprod+fp16+rcpc+ssbs"
-                            detected_tune="neoverse-n1"
-                            ;;
-                        0xd0d)  # Cortex-A77
-                            detected_march="armv8.2-a+crc+crypto+dotprod+fp16"
-                            detected_tune="cortex-a77"
-                            ;;
-                        0xd40)  # Neoverse V1 (AWS Graviton3)
-                            detected_march="armv8.4-a+crc+crypto+dotprod+fp16+sve+bf16+i8mm"
-                            detected_tune="neoverse-v1"
-                            ;;
-                        0xd41)  # Cortex-A78
-                            detected_march="armv8.2-a+crc+crypto+dotprod+fp16"
-                            detected_tune="cortex-a78"
-                            ;;
-                        0xd44)  # Cortex-X1
-                            detected_march="armv8.2-a+crc+crypto+dotprod+fp16"
-                            detected_tune="cortex-x1"
-                            ;;
-                        0xd46)  # Cortex-A510
-                            detected_march="armv9-a+crc+crypto+sve2"
-                            detected_tune="cortex-a510"
-                            ;;
-                        0xd47)  # Cortex-A710
-                            detected_march="armv9-a+crc+crypto+sve2"
-                            detected_tune="cortex-a710"
-                            ;;
-                        0xd48)  # Cortex-X2
-                            detected_march="armv9-a+crc+crypto+sve2"
-                            detected_tune="cortex-x2"
-                            ;;
-                        0xd49)  # Neoverse N2 (AWS Graviton4, Ampere AmpereOne)
-                            detected_march="armv9-a+crc+crypto+sve2+bf16+i8mm"
-                            detected_tune="neoverse-n2"
-                            ;;
-                        0xd4e)  # Neoverse V2 (GCP Axion)
-                            detected_march="armv9-a+crc+crypto+sve2+bf16+i8mm"
-                            detected_tune="neoverse-v2"
-                            ;;
-                        *)
-                            detected_march="armv8-a+crc+crypto"
-                            detected_tune="generic"
-                            ;;
-                    esac
-                    ;;
-                0x42)  # Broadcom (Raspberry Pi 4)
-                    detected_march="armv8-a+crc+crypto"
-                    detected_tune="cortex-a72"
-                    ;;
-                0x43)  # Cavium (ThunderX)
-                    detected_march="armv8.1-a+crc+crypto"
-                    detected_tune="thunderx2t99"
-                    ;;
-                0x46)  # Fujitsu (A64FX)
-                    detected_march="armv8.2-a+crc+crypto+sve"
-                    detected_tune="a64fx"
-                    ;;
-                0x48)  # HiSilicon (Kunpeng 920)
-                    detected_march="armv8.2-a+crc+crypto+dotprod+fp16"
-                    detected_tune="tsv110"
-                    ;;
-                0x51)  # Qualcomm
-                    detected_march="armv8.2-a+crc+crypto+dotprod"
-                    detected_tune="cortex-a76"
-                    ;;
-                0x61)  # Apple (Asahi Linux)
-                    detected_march="armv8.5-a+crc+crypto+sha3+fp16"
-                    detected_tune="apple-m1"
-                    ;;
-                0xc0)  # Ampere Computing (Altra/AmpereOne)
-                    detected_march="armv8.2-a+crc+crypto+dotprod+fp16+rcpc+ssbs"
-                    detected_tune="neoverse-n1"
-                    ;;
-                *)
-                    detected_march="armv8-a+crc+crypto"
-                    detected_tune="generic"
-                    ;;
-            esac
-
-            cc_opt="$cc_opt -march=$detected_march -mtune=$detected_tune"
-            cc_opt="$cc_opt $extra_flags"
-
-            # ARM64 特有优化：运行时检测LSE原子操作
-            if echo "$detected_march" | grep -qE "armv8\.[2-9]|armv9"; then
-                cc_opt="$cc_opt -moutline-atomics"
-            fi
+            cc_opt="$cc_opt -march=armv8-a+crc+crypto -mtune=generic"
             ;;
-
         armv7l|armv7*)
-            # ARMv7 检测
-            local cpu_part=$(grep -m1 "CPU part" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs)
-
-            case "$cpu_part" in
-                0xc07)  # Cortex-A7
-                    detected_march="armv7-a"
-                    detected_tune="cortex-a7"
-                    ;;
-                0xc09)  # Cortex-A9
-                    detected_march="armv7-a"
-                    detected_tune="cortex-a9"
-                    ;;
-                0xc0d)  # Cortex-A12
-                    detected_march="armv7-a"
-                    detected_tune="cortex-a12"
-                    ;;
-                0xc0e)  # Cortex-A17
-                    detected_march="armv7-a"
-                    detected_tune="cortex-a17"
-                    ;;
-                0xc0f)  # Cortex-A15
-                    detected_march="armv7-a"
-                    detected_tune="cortex-a15"
-                    ;;
-                *)
-                    detected_march="armv7-a"
-                    detected_tune="generic-armv7-a"
-                    ;;
-            esac
-
-            # 检测NEON支持
-            if grep -q "neon" /proc/cpuinfo 2>/dev/null; then
-                cc_opt="$cc_opt -march=$detected_march -mtune=$detected_tune -mfpu=neon-vfpv4 -mfloat-abi=hard"
-            else
-                cc_opt="$cc_opt -march=$detected_march -mtune=$detected_tune -mfpu=vfpv4 -mfloat-abi=hard"
-            fi
-            cc_opt="$cc_opt $extra_flags"
+            cc_opt="$cc_opt -march=armv7-a -mtune=generic-armv7-a -mfpu=neon"
             ;;
-
         *)
-            # 未知架构 - 仅使用基础优化
-            cc_opt="$cc_opt $extra_flags"
+            # 未知架构使用通用优化
             ;;
     esac
 
     echo "$cc_opt"
-}
-
-# 获取CPU优化信息的辅助函数（用于显示详细信息）
-get_cpu_optimization_info() {
-    local arch=$(uname -m)
-    local info=""
-
-    case $arch in
-        x86_64)
-            local cpu_info=$(cat /proc/cpuinfo 2>/dev/null)
-            local model_name=$(echo "$cpu_info" | grep -m1 "model name" | cut -d: -f2 | xargs)
-            local vendor=$(echo "$cpu_info" | grep -m1 "vendor_id" | cut -d: -f2 | xargs)
-
-            local level="x86-64 (v1)"
-            if echo "$cpu_info" | grep -q "avx512f" && echo "$cpu_info" | grep -q "avx512vl"; then
-                level="x86-64-v4 (AVX-512)"
-            elif echo "$cpu_info" | grep -q "avx2"; then
-                level="x86-64-v3 (AVX2)"
-            elif echo "$cpu_info" | grep -q "sse4_2"; then
-                level="x86-64-v2 (SSE4.2)"
-            fi
-
-            info="CPU: $model_name | Vendor: $vendor | Level: $level"
-            ;;
-        aarch64|arm64)
-            local implementer=$(grep -m1 "CPU implementer" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs)
-            local part=$(grep -m1 "CPU part" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs)
-
-            local vendor_name="Unknown"
-            case "$implementer" in
-                0x41) vendor_name="ARM Ltd" ;;
-                0x42) vendor_name="Broadcom" ;;
-                0x43) vendor_name="Cavium" ;;
-                0x46) vendor_name="Fujitsu" ;;
-                0x48) vendor_name="HiSilicon" ;;
-                0x51) vendor_name="Qualcomm" ;;
-                0x61) vendor_name="Apple" ;;
-                0xc0) vendor_name="Ampere" ;;
-            esac
-
-            info="ARM64 | Vendor: $vendor_name ($implementer) | Part: $part"
-            ;;
-        *)
-            info="Architecture: $arch"
-            ;;
-    esac
-
-    echo "$info"
 }
 
 # 更新软件源并安装依赖
@@ -553,22 +153,20 @@ install_dependencies() {
             pcre_packages="libpcre2-dev"
         fi
 
-        # 编译安装需要的额外依赖（HTTP/3需要的依赖）
+        # 编译安装需要的额外依赖
         apt-get install -y $base_deps \
             build-essential cmake git pkg-config \
             $pcre_packages \
             zlib1g-dev libssl-dev \
             libxml2-dev libxslt1-dev \
             libgd-dev libgeoip-dev \
-            libperl-dev perl-base perl \
-            golang-go mercurial 2>/dev/null || {
+            libperl-dev perl-base perl 2>/dev/null || {
                 # 如果安装失败，尝试不安装可选依赖
                 print_warning "部分可选依赖安装失败，尝试安装核心依赖..."
                 apt-get install -y $base_deps \
                     build-essential cmake git pkg-config \
                     $pcre_packages \
-                    zlib1g-dev libssl-dev \
-                    golang-go mercurial
+                    zlib1g-dev libssl-dev
             }
 
         # 尝试安装 libgoogle-perftools-dev（可选，某些系统没有）
@@ -584,7 +182,7 @@ install_dependencies() {
 
 # 编译安装Nginx
 compile_install_nginx() {
-    print_info "开始编译安装Nginx (支持HTTP/3)..."
+    print_info "开始编译安装Nginx..."
 
     # 清理旧的编译目录
     if [[ -d "$COMPILE_PATH" ]]; then
@@ -598,7 +196,7 @@ compile_install_nginx() {
 
     # 使用最新的主线版本nginx
     local NGINX_VERSION="1.29.4"  # Nginx最新主线版
-    print_info "使用Nginx版本: $NGINX_VERSION (主线版，支持HTTP/3)"
+    print_info "使用Nginx版本: $NGINX_VERSION (主线版)"
 
     # 下载nginx源码
     print_info "下载Nginx源码..."
@@ -606,23 +204,6 @@ compile_install_nginx() {
     tar -zxf nginx-$NGINX_VERSION.tar.gz
     rm nginx-$NGINX_VERSION.tar.gz
     mv nginx-$NGINX_VERSION nginx_src
-
-    # 编译新版QuicTLS (基于OpenSSL 3.3的完整分支)
-    print_info "编译QuicTLS (基于OpenSSL 3.3的QUIC分支)..."
-    git clone --depth=1 https://github.com/quictls/quictls
-    cd quictls
-    
-    # 配置QuicTLS
-    ./config \
-        --prefix=/usr/local/quictls \
-        --openssldir=/usr/local/quictls \
-        enable-ktls
-    
-    # 编译安装
-    make -j$(nproc)
-    make install
-    cd ..
-    print_success "QuicTLS编译完成 (OpenSSL 3.3+QUIC)"
 
     # 下载并编译ngx_brotli模块
     print_info "下载Brotli模块..."
@@ -639,30 +220,16 @@ compile_install_nginx() {
     local CC_OPT=$(detect_cpu_optimization)
 
     # 显示优化信息
-    print_info "CPU信息: $(get_cpu_optimization_info)"
-    if echo "$CC_OPT" | grep -q "x86-64-v4"; then
-        print_info "应用 x86-64-v4 优化 (AVX-512)"
-    elif echo "$CC_OPT" | grep -q "x86-64-v3"; then
+    if echo "$CC_OPT" | grep -q "x86-64-v3"; then
         print_info "应用 x86-64-v3 优化 (AVX2)"
     elif echo "$CC_OPT" | grep -q "x86-64-v2"; then
-        print_info "应用 x86-64-v2 优化 (SSE4.2)"
-    elif echo "$CC_OPT" | grep -q "armv9"; then
-        print_info "应用 ARMv9 优化 (SVE2)"
-    elif echo "$CC_OPT" | grep -q "armv8\.[4-5]"; then
-        print_info "应用 ARMv8.4/8.5 优化"
-    elif echo "$CC_OPT" | grep -q "armv8\.2"; then
-        print_info "应用 ARMv8.2 优化 (DotProd/FP16)"
+        print_info "应用 x86-64-v2 优化 (SSE4)"
     elif echo "$CC_OPT" | grep -q "armv8"; then
-        print_info "应用 ARMv8 优化"
+        print_info "应用 ARM64 优化"
     elif echo "$CC_OPT" | grep -q "armv7"; then
         print_info "应用 ARMv7 优化"
     else
         print_info "应用通用优化"
-    fi
-    # 显示 -mtune 目标
-    local tune_target=$(echo "$CC_OPT" | grep -oE "\-mtune=[a-z0-9\-]+" | cut -d= -f2)
-    if [[ -n "$tune_target" && "$tune_target" != "generic" ]]; then
-        print_info "针对 $tune_target 微架构调优"
     fi
 
     # 创建nginx用户
@@ -734,8 +301,7 @@ compile_install_nginx() {
         --with-stream_ssl_preread_module \
         --add-module=$COMPILE_PATH/ngx_brotli \
         --with-compat \
-        --with-cc-opt="$CC_OPT -I/usr/local/quictls/include" \
-        --with-ld-opt="-L/usr/local/quictls/lib -Wl,-rpath,/usr/local/quictls/lib"
+        --with-cc-opt="$CC_OPT"
 
     if [[ $? -ne 0 ]]; then
         print_error "Nginx配置失败"
@@ -1061,11 +627,6 @@ NGINX_CONF_START
                     '$status $body_bytes_sent "$http_referer" '
                     '"$http_user_agent" "$http_x_forwarded_for"';
     
-    # QUIC/HTTP3专用日志格式
-    log_format quic '$remote_addr - $remote_user [$time_local] "$request" '
-                    '$status $body_bytes_sent "$http_referer" "$http_user_agent" '
-                    'quic="$quic" h3="$http3"';
-    
     access_log /var/log/nginx/access.log main;
     
     sendfile on;
@@ -1078,17 +639,14 @@ NGINX_CONF_START
     
     gzip on;
     
-    # SSL/TLS/QUIC通用配置
+    # SSL通用配置
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
     ssl_prefer_server_ciphers on;
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
-    
-    # QUIC/HTTP3配置
-    quic_retry on;
     ssl_early_data on;
-    
+
 NGINX_CONF_MIDDLE
 
     # 为每个域名添加server块
@@ -1097,14 +655,10 @@ NGINX_CONF_MIDDLE
     server {
         listen 443 ssl;
         listen [::]:443 ssl;
-        
-        # HTTP/3支持 (QUIC over UDP)
         listen 443 quic reuseport;
         listen [::]:443 quic reuseport;
-        
         http2 on;
         http3 on;
-        
         server_name $domain;
         
         root /var/www/html;
@@ -1112,14 +666,8 @@ NGINX_CONF_MIDDLE
         
         ssl_certificate $CERT_DIR/${domain}/fullchain.cer;
         ssl_certificate_key $CERT_DIR/${domain}/private.key;
-        
-        # 通过Alt-Svc头告知客户端支持HTTP/3
         add_header Alt-Svc 'h3=":443"; ma=86400';
-        
-        # QUIC传输参数
-        quic_gso on;
-        quic_mtu 1452;
-        
+
         client_header_timeout 5m;
         keepalive_timeout 5m;
         
@@ -1194,7 +742,11 @@ install_xray() {
     print_info "系统架构: $arch"
     
     print_info "获取Xray最新版本..."
-    local latest_version=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep -oP '"tag_name": "\K(.*)(?=")')
+    local latest_version=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p')
+    if [[ -z "$latest_version" ]]; then
+        print_error "无法获取Xray最新版本，请检查网络连接"
+        exit 1
+    fi
     print_info "最新版本: $latest_version"
     
     local download_url="https://github.com/XTLS/Xray-core/releases/download/${latest_version}/Xray-${arch}.zip"
@@ -1506,11 +1058,10 @@ show_proxy_info() {
     echo -e "${BLUE}协议:${NC} VLESS"
     echo -e "${BLUE}UUID:${NC} ${uuid}"
     echo -e "${BLUE}域名:${NC} ${domains_input}"
-    echo -e "${BLUE}端口:${NC} 443 (TCP) / 443 (UDP for HTTP/3)"
+    echo -e "${BLUE}端口:${NC} 443"
     echo -e "${BLUE}传输:${NC} XHTTP"
     echo -e "${BLUE}路径:${NC} ${path}"
-    echo -e "${BLUE}TLS:${NC} 启用 (支持 HTTP/2 和 HTTP/3)"
-    echo -e "${BLUE}QUIC:${NC} 已启用 (UDP 443)"
+    echo -e "${BLUE}TLS:${NC} 启用"
     
     # 显示CA信息
     if [[ -f /tmp/xray_ca.txt ]]; then
@@ -1527,7 +1078,6 @@ show_proxy_info() {
     fi
     
     echo -e "${GREEN}=========================================${NC}"
-    echo -e "${YELLOW}提示: 客户端将通过Alt-Svc头自动发现HTTP/3支持${NC}"
     echo ""
 }
 
@@ -1553,9 +1103,6 @@ partial_uninstall() {
     rm -f /usr/sbin/nginx
     rm -f $NGINX_SERVICE
     rm -rf /usr/lib/nginx
-    
-    # 删除quictls（如果存在）
-    rm -rf /usr/local/quictls
 
     # 卸载nginx软件包（软件源安装）
     apt-get remove -y nginx nginx-common 2>/dev/null || true
