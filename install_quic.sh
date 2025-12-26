@@ -650,8 +650,11 @@ NGINX_CONF_START
 NGINX_CONF_MIDDLE
 
     # 为每个域名添加server块
+    local is_first_domain=true
     for domain in "${domains[@]}"; do
-        cat >> $NGINX_CONF << DOMAIN_BLOCK
+        if [[ "$is_first_domain" == true ]]; then
+            # 第一个域名：使用 reuseport
+            cat >> $NGINX_CONF << DOMAIN_BLOCK
     server {
         listen 443 ssl;
         listen [::]:443 ssl;
@@ -686,6 +689,45 @@ NGINX_CONF_MIDDLE
     }
     
 DOMAIN_BLOCK
+            is_first_domain=false
+        else
+            # 后续域名：不使用 reuseport
+            cat >> $NGINX_CONF << DOMAIN_BLOCK
+    server {
+        listen 443 ssl;
+        listen [::]:443 ssl;
+        listen 443 quic;
+        listen [::]:443 quic;
+        http2 on;
+        http3 on;
+        server_name $domain;
+        
+        root /var/www/html;
+        index index.html;
+        
+        ssl_certificate $CERT_DIR/${domain}/fullchain.cer;
+        ssl_certificate_key $CERT_DIR/${domain}/private.key;
+        add_header Alt-Svc 'h3=":443"; ma=86400';
+
+        client_header_timeout 5m;
+        keepalive_timeout 5m;
+        
+        location $random_path {
+            client_max_body_size 0;
+            grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            client_body_timeout 5m;
+            grpc_read_timeout 315;
+            grpc_send_timeout 5m;
+            grpc_pass unix:${SOCKET_PATH};
+        }
+        
+        location / {
+            try_files \$uri \$uri/ =404;
+        }
+    }
+    
+DOMAIN_BLOCK
+        fi
     done
     
     # 添加HTTP到HTTPS重定向并关闭http块
