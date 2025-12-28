@@ -1206,18 +1206,54 @@ install_xray() {
     print_info "系统架构: $arch"
     
     print_info "获取Xray最新版本..."
-    local latest_version=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p')
+    local latest_version=""
+    
+    # 方法1: 优先使用 IPv6 访问 GitHub API（原生网络通常更可靠）
+    latest_version=$(curl -6 -sL --connect-timeout 10 --max-time 30 \
+        "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null | \
+        sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p')
+    
+    # 方法2: IPv6 失败则尝试不限制 IP 版本
     if [[ -z "$latest_version" ]]; then
-        print_error "无法获取Xray最新版本，请检查网络连接"
-        exit 1
+        print_warning "IPv6 获取失败，尝试默认网络..."
+        latest_version=$(curl -sL --connect-timeout 10 --max-time 30 \
+            "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null | \
+            sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p')
     fi
-    print_info "最新版本: $latest_version"
+    
+    # 方法3: 通过重定向 URL 提取版本号
+    if [[ -z "$latest_version" ]]; then
+        print_warning "API 获取失败，尝试备用方法..."
+        latest_version=$(curl -6 -sI --connect-timeout 10 \
+            "https://github.com/XTLS/Xray-core/releases/latest" 2>/dev/null | \
+            grep -i "^location:" | grep -oP 'v[0-9]+\.[0-9]+\.[0-9]+')
+    fi
+    
+    if [[ -z "$latest_version" ]]; then
+        print_error "无法获取Xray最新版本"
+        print_info "请手动指定版本，例如: v25.12.8"
+        read -p "输入版本号 (留空使用 v25.12.8): " manual_version
+        latest_version=${manual_version:-"v25.12.8"}
+    fi
+    print_info "使用版本: $latest_version"
     
     local download_url="https://github.com/XTLS/Xray-core/releases/download/${latest_version}/Xray-${arch}.zip"
     
     print_info "下载Xray..."
+    print_info "下载地址: $download_url"
     cd /tmp
-    wget -q "$download_url" -O xray.zip
+    
+    # 下载优先使用 IPv6，失败则尝试 IPv4（WARP）
+    if ! wget -6 --timeout=60 -q "$download_url" -O xray.zip 2>/dev/null; then
+        print_warning "IPv6 下载失败，尝试 IPv4..."
+        if ! wget -4 --timeout=60 -q "$download_url" -O xray.zip 2>/dev/null; then
+            print_warning "IPv4 下载失败，尝试默认网络..."
+            wget --timeout=60 -q "$download_url" -O xray.zip || {
+                print_error "下载失败，请检查网络连接"
+                exit 1
+            }
+        fi
+    fi
     
     print_info "解压Xray..."
     unzip -q -o xray.zip -d xray-tmp
