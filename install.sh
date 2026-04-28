@@ -24,6 +24,13 @@ ACME_SCRIPT="/root/.acme.sh/acme.sh"
 SOCKET_PATH="/dev/shm/xray.socket"
 COMPILE_PATH="/tmp/nginx_compile"
 NGINX_INSTALL_METHOD="" # package 或 compile
+ACME_WEBROOT="/var/www/acme"
+DOMAIN_CERT_RENEW_THRESHOLD_DAYS=30
+IP_CERT_RENEW_THRESHOLD_HOURS=72
+IP_CERT_RENEW_DAYS=3
+DOMAINS=()
+IPV4_ADDRS=()
+IPV6_ADDRS=()
 
 # 打印信息函数
 print_info() {
@@ -57,6 +64,7 @@ create_directories() {
     mkdir -p /var/www/html
     mkdir -p /usr/local/etc/xray
     mkdir -p $CERT_DIR
+    mkdir -p "$ACME_WEBROOT/.well-known/acme-challenge"
     print_success "目录创建完成"
 }
 
@@ -527,7 +535,7 @@ install_dependencies() {
     print_info "安装依赖包..."
 
     # 基础依赖（所有安装方式都需要）
-    local base_deps="curl wget sudo socat cron tar gzip unzip openssl ca-certificates"
+    local base_deps="curl wget sudo socat cron tar gzip unzip openssl ca-certificates iproute2"
 
     if [[ "$NGINX_INSTALL_METHOD" == "compile" ]]; then
         print_info "安装编译依赖..."
@@ -591,7 +599,7 @@ compile_install_nginx() {
     cd $COMPILE_PATH
 
     # 使用最新的主线版本nginx
-    local NGINX_VERSION="1.29.4"  # Nginx最新主线版
+    local NGINX_VERSION="1.30.0"  # Nginx最新主线版
     print_info "使用Nginx版本: $NGINX_VERSION (主线版)"
 
     # 下载nginx源码
@@ -912,70 +920,396 @@ select_ca() {
     print_success "CA设置完成"
 }
 
-# 申请TLS证书
-apply_certificate() {
-    local domain=$1
-    local cert_path="$CERT_DIR/${domain}"
-    
-    mkdir -p "$cert_path"
-    
-    # 检查证书是否已存在且有效
-    if [[ -f "$cert_path/fullchain.cer" ]] && [[ -f "$cert_path/private.key" ]]; then
-        local expiry_date=$(openssl x509 -enddate -noout -in "$cert_path/fullchain.cer" | cut -d= -f2)
-        local expiry_epoch=$(date -d "$expiry_date" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$expiry_date" +%s 2>/dev/null)
-        local current_epoch=$(date +%s)
-        local days_left=$(( ($expiry_epoch - $current_epoch) / 86400 ))
-        
-        if [[ $days_left -gt 30 ]]; then
-            print_warning "域名 $domain 的证书仍有效（剩余${days_left}天），跳过申请"
+# 获取可用的 Nginx 运行用户
+get_nginx_user() {
+    if id -u www-data &>/dev/null; then
+        echo "www-data"
+    elif id -u nginx &>/dev/null; then
+        echo "nginx"
+    else
+        echo "nobody"
+    fi
+}
+
+# 标准化 IP 输入：IPv6 不要带 []，去掉 zone id
+normalize_ip_literal() {
+    local ip="$1"
+    ip="${ip#[}"
+    ip="${ip%]}"
+    ip="${ip%%%*}"
+    echo "$ip"
+}
+
+# IPv4 基础校验
+is_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    local IFS='.'
+    local -a o
+    read -r -a o <<< "$ip"
+    for n in "${o[@]}"; do
+        [[ "$n" =~ ^[0-9]+$ ]] || return 1
+        (( n >= 0 && n <= 255 )) || return 1
+    done
+    return 0
+}
+
+# 排除私网、链路本地、保留地址、文档地址、多播等，不把它们当公网 IPv4 申请证书
+is_public_ipv4() {
+    local ip="$1"
+    is_ipv4 "$ip" || return 1
+    local IFS='.'
+    local -a o
+    read -r -a o <<< "$ip"
+    local a=${o[0]} b=${o[1]} c=${o[2]}
+
+    (( a == 0 )) && return 1
+    (( a == 10 )) && return 1
+    (( a == 127 )) && return 1
+    (( a == 169 && b == 254 )) && return 1
+    (( a == 172 && b >= 16 && b <= 31 )) && return 1
+    (( a == 192 && b == 168 )) && return 1
+    (( a == 100 && b >= 64 && b <= 127 )) && return 1
+    (( a == 192 && b == 0 && c == 0 )) && return 1
+    (( a == 192 && b == 0 && c == 2 )) && return 1
+    (( a == 198 && (b == 18 || b == 19) )) && return 1
+    (( a == 198 && b == 51 && c == 100 )) && return 1
+    (( a == 203 && b == 0 && c == 113 )) && return 1
+    (( a >= 224 )) && return 1
+    return 0
+}
+
+# IPv6 粗校验与公网过滤：排除 loopback、link-local、ULA、multicast、documentation prefix
+is_ipv6() {
+    local ip
+    ip=$(normalize_ip_literal "$1")
+    [[ "$ip" == *:* ]] || return 1
+    [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+    return 0
+}
+
+is_public_ipv6() {
+    local ip lower first
+    ip=$(normalize_ip_literal "$1")
+    is_ipv6 "$ip" || return 1
+    lower="${ip,,}"
+    first="${lower%%:*}"
+
+    [[ "$lower" == "::" ]] && return 1
+    [[ "$lower" == "::1" ]] && return 1
+    [[ "$lower" == 2001:db8:* ]] && return 1
+    [[ "$first" == fe80 ]] && return 1
+    [[ "$first" == fc* ]] && return 1
+    [[ "$first" == fd* ]] && return 1
+    [[ "$first" == ff* ]] && return 1
+    return 0
+}
+
+# 自动检测网卡上的公网 IPv4。私网/NAT/文档地址会被排除。
+detect_public_ipv4_addresses() {
+    local ip
+    while read -r ip; do
+        ip=$(normalize_ip_literal "$ip")
+        if is_public_ipv4 "$ip"; then
+            echo "$ip"
+        fi
+    done < <(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | sort -u)
+}
+
+# 自动检测网卡上的公网 IPv6。排除 temporary/deprecated/tentative/dadfailed，避免申请临时隐私地址证书。
+detect_public_ipv6_addresses() {
+    local ip
+    while read -r ip; do
+        ip=$(normalize_ip_literal "$ip")
+        if is_public_ipv6 "$ip"; then
+            echo "$ip"
+        fi
+    done < <(ip -o -6 addr show scope global 2>/dev/null \
+        | grep -vE '\b(temporary|deprecated|tentative|dadfailed)\b' \
+        | awk '{print $4}' | cut -d/ -f1 | sed 's/%.*//' | sort -u)
+}
+
+append_unique() {
+    local -n arr_ref=$1
+    local value="$2"
+    local item
+    [[ -z "$value" ]] && return 0
+    for item in "${arr_ref[@]}"; do
+        [[ "$item" == "$value" ]] && return 0
+    done
+    arr_ref+=("$value")
+}
+
+read_manual_ips() {
+    local family="$1"
+    local -n out_ref=$2
+    local input raw ip
+
+    if [[ "$family" == "IPv6" ]]; then
+        print_info "请输入公网 IPv6 地址，多个用空格分隔；IPv6 不要带方括号，例如：2001:4860:4860::8888"
+    else
+        print_info "请输入公网 IPv4 地址，多个用空格分隔，例如：8.8.8.8"
+    fi
+    read -p "> " input
+
+    for raw in $input; do
+        ip=$(normalize_ip_literal "$raw")
+        if [[ "$family" == "IPv6" ]]; then
+            if is_public_ipv6 "$ip"; then
+                append_unique out_ref "$ip"
+            else
+                print_warning "跳过非公网或格式不正确的 IPv6: $raw"
+            fi
+        else
+            if is_public_ipv4 "$ip"; then
+                append_unique out_ref "$ip"
+            else
+                print_warning "跳过非公网或格式不正确的 IPv4: $raw"
+            fi
+        fi
+    done
+}
+
+collect_addresses_for_family() {
+    local family="$1"
+    local -n out_ref=$2
+    local -a detected=()
+    local use_auto add_more item
+
+    if [[ "$family" == "IPv6" ]]; then
+        mapfile -t detected < <(detect_public_ipv6_addresses)
+    else
+        mapfile -t detected < <(detect_public_ipv4_addresses)
+    fi
+
+    echo ""
+    print_info "自动检测到的公网 $family 地址："
+    if [[ ${#detected[@]} -gt 0 ]]; then
+        for item in "${detected[@]}"; do
+            echo "  - $item"
+        done
+        read -p "是否使用这些 $family 地址申请 IP 证书？[Y/n]: " use_auto
+        case ${use_auto:-Y} in
+            y|Y|yes|YES|Yes)
+                for item in "${detected[@]}"; do
+                    append_unique out_ref "$item"
+                done
+                ;;
+            *)
+                read_manual_ips "$family" out_ref
+                ;;
+        esac
+    else
+        print_warning "未自动检测到可用公网 $family 地址。"
+        read_manual_ips "$family" out_ref
+    fi
+
+    read -p "是否额外追加手动 $family 地址？[y/N]: " add_more
+    case ${add_more:-N} in
+        y|Y|yes|YES|Yes)
+            read_manual_ips "$family" out_ref
+            ;;
+    esac
+}
+
+select_certificate_entry_mode() {
+    echo ""
+    echo -e "${GREEN}请选择证书入口模式:${NC}"
+    echo "1) 仅安装域名证书（多域名 SNI）"
+    echo "2) 安装域名证书 + IPv6 证书（自动检测/手动补充公网 IPv6）"
+    echo "3) 安装域名证书 + IPv4 证书 + IPv6 证书（自动检测/手动补充公网 IPv4/IPv6）"
+    echo ""
+    read -p "请选择 [1-3，默认1]: " cert_entry_choice
+
+    case ${cert_entry_choice:-1} in
+        1) CERT_ENTRY_MODE="domain_only" ;;
+        2) CERT_ENTRY_MODE="domain_ipv6" ;;
+        3) CERT_ENTRY_MODE="domain_ipv4_ipv6" ;;
+        *) CERT_ENTRY_MODE="domain_only" ;;
+    esac
+
+    print_info "证书入口模式: $CERT_ENTRY_MODE"
+}
+
+cert_safe_name() {
+    local identifier
+    identifier=$(normalize_ip_literal "$1")
+    if is_ipv4 "$identifier" || is_ipv6 "$identifier"; then
+        echo "ip-$(echo "$identifier" | sed 's/[.:]/_/g')"
+    else
+        echo "$identifier"
+    fi
+}
+
+cert_path_for_identifier() {
+    local identifier="$1"
+    echo "$CERT_DIR/$(cert_safe_name "$identifier")"
+}
+
+get_cert_expiry_epoch() {
+    local cert_file="$1"
+    local expiry_date
+    expiry_date=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+    [[ -z "$expiry_date" ]] && return 1
+    date -d "$expiry_date" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$expiry_date" +%s 2>/dev/null
+}
+
+certificate_still_valid_enough() {
+    local identifier="$1"
+    local cert_type="$2" # domain 或 ip
+    local cert_path
+    cert_path=$(cert_path_for_identifier "$identifier")
+
+    [[ -f "$cert_path/fullchain.cer" && -f "$cert_path/private.key" ]] || return 1
+
+    local expiry_epoch current_epoch seconds_left days_left hours_left
+    expiry_epoch=$(get_cert_expiry_epoch "$cert_path/fullchain.cer") || return 1
+    current_epoch=$(date +%s)
+    seconds_left=$(( expiry_epoch - current_epoch ))
+
+    if [[ "$cert_type" == "ip" ]]; then
+        hours_left=$(( seconds_left / 3600 ))
+        if (( hours_left > IP_CERT_RENEW_THRESHOLD_HOURS )); then
+            print_warning "IP $identifier 的短证书仍有效（约剩余 ${hours_left} 小时），跳过申请"
+            return 0
+        fi
+    else
+        days_left=$(( seconds_left / 86400 ))
+        if (( days_left > DOMAIN_CERT_RENEW_THRESHOLD_DAYS )); then
+            print_warning "域名 $identifier 的证书仍有效（剩余 ${days_left} 天），跳过申请"
             return 0
         fi
     fi
-    
-    print_info "为域名 $domain 申请证书..."
-    
-    # 临时停止nginx以通过HTTP验证
-    local nginx_was_running=false
-    if systemctl is-active --quiet nginx; then
-        nginx_was_running=true
-        systemctl stop nginx
+
+    return 1
+}
+
+ensure_acme_profile_support_for_ip() {
+    if ! grep -q "certificate-profile\|cert-profile" "$ACME_SCRIPT" 2>/dev/null; then
+        print_warning "当前 acme.sh 可能不支持 certificate profile，尝试升级 acme.sh..."
+        $ACME_SCRIPT --upgrade --auto-upgrade || true
     fi
-    
-    # 申请证书 - 使用standalone模式进行HTTP-01验证
-    # 优先使用IPv6验证，无全局IPv6地址时才使用IPv4
-    local listen_flag=""
-    local has_ipv6_global=$(ip -6 addr show scope global 2>/dev/null | grep -c "inet6")
-    
-    if [[ "$has_ipv6_global" -gt 0 ]]; then
-        print_info "检测到全局 IPv6 地址，优先使用 IPv6 监听模式"
-        listen_flag="--listen-v6"
+}
+
+# 申请/安装 TLS 证书：域名证书使用普通 profile；IP 证书使用 Let's Encrypt shortlived profile。
+# 使用 webroot 而不是 standalone，避免续期时抢占 80 端口；install-cert 带 reloadcmd。
+apply_certificate() {
+    local identifier="$1"
+    local cert_type="$2" # domain 或 ip
+    local cert_path
+    cert_path=$(cert_path_for_identifier "$identifier")
+
+    mkdir -p "$cert_path" "$ACME_WEBROOT/.well-known/acme-challenge"
+
+    if certificate_still_valid_enough "$identifier" "$cert_type"; then
+        # 即使证书未到更新阈值，也补写 install-cert 的 reloadcmd，修复旧脚本续期后不重载 Nginx 的问题。
+        $ACME_SCRIPT --install-cert -d "$identifier" \
+            --key-file "$cert_path/private.key" \
+            --fullchain-file "$cert_path/fullchain.cer" \
+            --reloadcmd "systemctl reload nginx || systemctl restart nginx" >/dev/null 2>&1 \
+            || print_warning "未能为 $identifier 补写 acme.sh install-cert/reloadcmd，可能是 acme.sh 未保存该证书订单信息"
+        return 0
+    fi
+
+    local issue_server="$CA_SERVER"
+    local -a issue_args
+
+    if [[ "$cert_type" == "ip" ]]; then
+        ensure_acme_profile_support_for_ip
+        issue_server="letsencrypt"
+        print_info "为 IP $identifier 申请 Let's Encrypt shortlived IP 证书..."
+        issue_args=(--issue -d "$identifier" -w "$ACME_WEBROOT" --server "$issue_server" --certificate-profile shortlived --days "$IP_CERT_RENEW_DAYS" --force)
     else
-        print_info "未检测到全局 IPv6 地址，使用 IPv4 监听模式"
-        listen_flag="--listen-v4"
+        print_info "为域名 $identifier 申请证书..."
+        issue_args=(--issue -d "$identifier" -w "$ACME_WEBROOT" --server "$issue_server" --force)
     fi
-    
-    print_info "使用 HTTP-01 验证方式申请证书..."
-    $ACME_SCRIPT --issue -d "$domain" --standalone --httpport 80 $listen_flag --force
-    
+
+    print_info "使用 webroot HTTP-01 验证目录: $ACME_WEBROOT"
+    $ACME_SCRIPT "${issue_args[@]}"
+
     if [[ $? -ne 0 ]]; then
-        print_error "证书申请失败"
-        if [[ $nginx_was_running == true ]]; then
-            systemctl start nginx
-        fi
+        print_error "证书申请失败: $identifier"
         return 1
     fi
-    
-    # 安装证书（不设置reload命令，避免nginx未运行时报错）
-    $ACME_SCRIPT --install-cert -d "$domain" \
+
+    $ACME_SCRIPT --install-cert -d "$identifier" \
         --key-file "$cert_path/private.key" \
-        --fullchain-file "$cert_path/fullchain.cer"
-    
-    # 恢复nginx状态
-    if [[ $nginx_was_running == true ]]; then
-        systemctl start nginx
+        --fullchain-file "$cert_path/fullchain.cer" \
+        --reloadcmd "systemctl reload nginx || systemctl restart nginx"
+
+    print_success "证书安装完成: $identifier -> $cert_path"
+}
+
+# 写入临时 HTTP-only Nginx 配置，确保 ACME webroot 验证在申请证书前可用。
+configure_nginx_acme_http_only() {
+    print_info "写入临时 ACME HTTP 验证配置..."
+
+    local mime_types_path=""
+    local nginx_user
+    nginx_user=$(get_nginx_user)
+
+    for path in "/etc/nginx/mime.types" "/usr/share/nginx/mime.types" "/usr/local/nginx/conf/mime.types"; do
+        if [[ -f "$path" ]]; then
+            mime_types_path="$path"
+            break
+        fi
+    done
+
+    if [[ -z "$mime_types_path" ]]; then
+        mime_types_path="/etc/nginx/mime.types"
+        cat > "$mime_types_path" << 'MIME_EOF'
+types {
+    text/html                             html htm shtml;
+    text/css                              css;
+    text/xml                              xml;
+    image/gif                             gif;
+    image/jpeg                            jpeg jpg;
+    application/javascript                js;
+    text/plain                            txt;
+    image/png                             png;
+    image/x-icon                          ico;
+    image/svg+xml                         svg svgz;
+    application/json                      json;
+}
+MIME_EOF
     fi
-    
-    print_success "域名 $domain 证书申请完成"
+
+    cat > "$NGINX_CONF" << EOF
+user $nginx_user;
+worker_processes auto;
+error_log /var/log/nginx/error.log notice;
+pid /run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include $mime_types_path;
+    default_type application/octet-stream;
+    server_tokens off;
+
+    server {
+        listen 80 default_server;
+        listen [::]:80 default_server;
+        server_name _;
+
+        location ^~ /.well-known/acme-challenge/ {
+            root $ACME_WEBROOT;
+            default_type text/plain;
+            try_files \$uri =404;
+        }
+
+        location / {
+            root /var/www/html;
+            index index.html;
+            try_files \$uri \$uri/ =404;
+        }
+    }
+}
+EOF
+
+    restart_nginx
 }
 
 # 生成随机路径
@@ -984,25 +1318,162 @@ generate_random_path() {
 }
 
 # 配置Nginx
+write_common_proxy_locations() {
+    local random_path="$1"
+    cat >> "$NGINX_CONF" << LOCATION_BLOCK
+        client_header_timeout 5m;
+        keepalive_timeout 5m;
+
+        location $random_path {
+            client_max_body_size 0;
+            grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            client_body_timeout 5m;
+            grpc_read_timeout 315;
+            grpc_send_timeout 5m;
+            grpc_pass unix:${SOCKET_PATH};
+        }
+
+        location / {
+            try_files \$uri \$uri/ =404;
+        }
+LOCATION_BLOCK
+}
+
+write_ip_server_block() {
+    local ip="$1"
+    local family="$2" # ipv4 或 ipv6
+    local random_path="$3"
+    local cert_path
+    cert_path=$(cert_path_for_identifier "$ip")
+
+    cat >> "$NGINX_CONF" << DOMAIN_BLOCK
+    server {
+DOMAIN_BLOCK
+
+    if [[ "$family" == "ipv6" ]]; then
+        cat >> "$NGINX_CONF" << DOMAIN_BLOCK
+        listen [$ip]:443 ssl default_server;
+        listen [$ip]:443 quic reuseport default_server;
+DOMAIN_BLOCK
+    else
+        cat >> "$NGINX_CONF" << DOMAIN_BLOCK
+        listen $ip:443 ssl default_server;
+        listen $ip:443 quic reuseport default_server;
+DOMAIN_BLOCK
+    fi
+
+    cat >> "$NGINX_CONF" << DOMAIN_BLOCK
+        http2 on;
+        http3 on;
+        server_name _;
+
+        root /var/www/html;
+        index index.html;
+
+        ssl_certificate $cert_path/fullchain.cer;
+        ssl_certificate_key $cert_path/private.key;
+        add_header Alt-Svc 'h3=":443"; ma=86400';
+
+DOMAIN_BLOCK
+
+    write_common_proxy_locations "$random_path"
+
+    cat >> "$NGINX_CONF" << 'DOMAIN_BLOCK'
+    }
+
+DOMAIN_BLOCK
+}
+
+write_domain_listen_directives() {
+    local is_first_domain="$1"
+    local ip
+
+    # IPv4：如果配置了 IPv4 IP 证书，域名站点也绑定这些具体 IPv4；否则使用 IPv4 wildcard。
+    if [[ ${#IPV4_ADDRS[@]} -gt 0 ]]; then
+        for ip in "${IPV4_ADDRS[@]}"; do
+            echo "        listen $ip:443 ssl;" >> "$NGINX_CONF"
+            echo "        listen $ip:443 quic;" >> "$NGINX_CONF"
+        done
+    else
+        echo "        listen 443 ssl;" >> "$NGINX_CONF"
+        if [[ "$is_first_domain" == "true" ]]; then
+            echo "        listen 443 quic reuseport;" >> "$NGINX_CONF"
+        else
+            echo "        listen 443 quic;" >> "$NGINX_CONF"
+        fi
+    fi
+
+    # IPv6：如果配置了 IPv6 IP 证书，域名站点也绑定这些具体 IPv6；否则使用 IPv6 wildcard。
+    if [[ ${#IPV6_ADDRS[@]} -gt 0 ]]; then
+        for ip in "${IPV6_ADDRS[@]}"; do
+            echo "        listen [$ip]:443 ssl;" >> "$NGINX_CONF"
+            echo "        listen [$ip]:443 quic;" >> "$NGINX_CONF"
+        done
+    else
+        echo "        listen [::]:443 ssl;" >> "$NGINX_CONF"
+        if [[ "$is_first_domain" == "true" ]]; then
+            echo "        listen [::]:443 quic reuseport;" >> "$NGINX_CONF"
+        else
+            echo "        listen [::]:443 quic;" >> "$NGINX_CONF"
+        fi
+    fi
+}
+
+write_domain_server_block() {
+    local domain="$1"
+    local random_path="$2"
+    local is_first_domain="$3"
+    local cert_path
+    cert_path=$(cert_path_for_identifier "$domain")
+
+    cat >> "$NGINX_CONF" << DOMAIN_BLOCK
+    server {
+DOMAIN_BLOCK
+
+    write_domain_listen_directives "$is_first_domain"
+
+    cat >> "$NGINX_CONF" << DOMAIN_BLOCK
+        http2 on;
+        http3 on;
+        server_name $domain;
+
+        root /var/www/html;
+        index index.html;
+
+        ssl_certificate $cert_path/fullchain.cer;
+        ssl_certificate_key $cert_path/private.key;
+        add_header Alt-Svc 'h3=":443"; ma=86400';
+
+DOMAIN_BLOCK
+
+    write_common_proxy_locations "$random_path"
+
+    cat >> "$NGINX_CONF" << 'DOMAIN_BLOCK'
+    }
+
+DOMAIN_BLOCK
+}
+
 configure_nginx() {
-    local domains=("$@")
-    
     print_info "配置Nginx..."
-    
-    # 生成随机路径
-    local random_path=$(generate_random_path)
+
+    # 生成随机路径；所有域名/IP 入口共用同一个 path 与同一个 Unix Socket。
+    local random_path
+    random_path=$(generate_random_path)
     echo "$random_path" > /tmp/xray_path.txt
-    
-    # 查找mime.types文件位置
+
     local mime_types_path=""
+    local path
+    local nginx_user
+    nginx_user=$(get_nginx_user)
+
     for path in "/etc/nginx/mime.types" "/usr/share/nginx/mime.types" "/usr/local/nginx/conf/mime.types"; do
         if [[ -f "$path" ]]; then
             mime_types_path="$path"
             break
         fi
     done
-    
-    # 如果找不到mime.types，创建一个基本的
+
     if [[ -z "$mime_types_path" ]]; then
         mime_types_path="/etc/nginx/mime.types"
         cat > "$mime_types_path" << 'MIME_EOF'
@@ -1023,10 +1494,9 @@ types {
 }
 MIME_EOF
     fi
-    
-    # 开始写入nginx配置 - 使用临时文件避免变量展开问题
-    cat > $NGINX_CONF << 'NGINX_CONF_START'
-user www-data;
+
+    cat > "$NGINX_CONF" << NGINX_CONF_START
+user $nginx_user;
 worker_processes auto;
 error_log /var/log/nginx/error.log notice;
 pid /run/nginx.pid;
@@ -1036,21 +1506,18 @@ events {
 }
 
 http {
+    include $mime_types_path;
 NGINX_CONF_START
 
-    # 添加mime.types路径
-    echo "    include $mime_types_path;" >> $NGINX_CONF
-    
-    # 继续写入配置
-    cat >> $NGINX_CONF << 'NGINX_CONF_MIDDLE'
+    cat >> "$NGINX_CONF" << 'NGINX_CONF_MIDDLE'
     default_type application/octet-stream;
-    
+
     log_format main '$remote_addr - $remote_user [$time_local] "$request" '
                     '$status $body_bytes_sent "$http_referer" '
                     '"$http_user_agent" "$http_x_forwarded_for"';
-    
+
     access_log /var/log/nginx/access.log main;
-    
+
     sendfile on;
     tcp_nopush on;
     tcp_nodelay on;
@@ -1058,9 +1525,9 @@ NGINX_CONF_START
     types_hash_max_size 2048;
     server_tokens off;
     client_max_body_size 0;
-    
+
     gzip on;
-    
+
     # SSL通用配置
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
@@ -1071,99 +1538,43 @@ NGINX_CONF_START
 
 NGINX_CONF_MIDDLE
 
-    # 为每个域名添加server块
-    local is_first_domain=true
-    for domain in "${domains[@]}"; do
-        if [[ "$is_first_domain" == true ]]; then
-            # 第一个域名：使用 reuseport
-            cat >> $NGINX_CONF << DOMAIN_BLOCK
-    server {
-        listen 443 ssl;
-        listen [::]:443 ssl;
-        listen 443 quic reuseport;
-        listen [::]:443 quic reuseport;
-        http2 on;
-        http3 on;
-        server_name $domain;
-        
-        root /var/www/html;
-        index index.html;
-        
-        ssl_certificate $CERT_DIR/${domain}/fullchain.cer;
-        ssl_certificate_key $CERT_DIR/${domain}/private.key;
-        add_header Alt-Svc 'h3=":443"; ma=86400';
-
-        client_header_timeout 5m;
-        keepalive_timeout 5m;
-        
-        location $random_path {
-            client_max_body_size 0;
-            grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-            client_body_timeout 5m;
-            grpc_read_timeout 315;
-            grpc_send_timeout 5m;
-            grpc_pass unix:${SOCKET_PATH};
-        }
-        
-        location / {
-            try_files \$uri \$uri/ =404;
-        }
-    }
-    
-DOMAIN_BLOCK
-            is_first_domain=false
-        else
-            # 后续域名：不使用 reuseport
-            cat >> $NGINX_CONF << DOMAIN_BLOCK
-    server {
-        listen 443 ssl;
-        listen [::]:443 ssl;
-        listen 443 quic;
-        listen [::]:443 quic;
-        http2 on;
-        http3 on;
-        server_name $domain;
-        
-        root /var/www/html;
-        index index.html;
-        
-        ssl_certificate $CERT_DIR/${domain}/fullchain.cer;
-        ssl_certificate_key $CERT_DIR/${domain}/private.key;
-        add_header Alt-Svc 'h3=":443"; ma=86400';
-
-        client_header_timeout 5m;
-        keepalive_timeout 5m;
-        
-        location $random_path {
-            client_max_body_size 0;
-            grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-            client_body_timeout 5m;
-            grpc_read_timeout 315;
-            grpc_send_timeout 5m;
-            grpc_pass unix:${SOCKET_PATH};
-        }
-        
-        location / {
-            try_files \$uri \$uri/ =404;
-        }
-    }
-    
-DOMAIN_BLOCK
-        fi
+    # IP 证书入口：每个公网 IP 单独 listen，作为该 IP:443 的 default_server。
+    local ip
+    for ip in "${IPV4_ADDRS[@]}"; do
+        write_ip_server_block "$ip" "ipv4" "$random_path"
     done
-    
-    # 添加HTTP到HTTPS重定向并关闭http块
-    cat >> $NGINX_CONF << 'NGINX_CONF_END'
+    for ip in "${IPV6_ADDRS[@]}"; do
+        write_ip_server_block "$ip" "ipv6" "$random_path"
+    done
+
+    # 域名入口：与 IP 入口共用同一个后端；如果存在 IP 入口，则域名 server 也绑定同一批具体 IP，保证 SNI 仍可选中域名证书。
+    local is_first_domain=true
+    local domain
+    for domain in "${DOMAINS[@]}"; do
+        write_domain_server_block "$domain" "$random_path" "$is_first_domain"
+        is_first_domain=false
+    done
+
+    cat >> "$NGINX_CONF" << NGINX_CONF_END
     server {
         listen 80 default_server;
         listen [::]:80 default_server;
         server_name _;
-        return 301 https://$host$request_uri;
+
+        location ^~ /.well-known/acme-challenge/ {
+            root $ACME_WEBROOT;
+            default_type text/plain;
+            try_files \$uri =404;
+        }
+
+        location / {
+            return 301 https://\$host\$request_uri;
+        }
     }
 }
 NGINX_CONF_END
-    
-    print_success "Nginx配置完成"
+
+    print_success "Nginx配置完成：多域名 + 多 IP 入口均转发到 unix:${SOCKET_PATH}"
 }
 
 # 验证并重启Nginx
@@ -1370,8 +1781,11 @@ EOF
     cat > /usr/local/etc/xray/install_info.conf << INFO_EOF
 # Xray 安装信息
 # 生成时间: $(date)
-UUID=$uuid
-PATH=$path
+UUID="$uuid"
+XRAY_PATH="$path"
+DOMAINS_TEXT="${DOMAINS[*]}"
+IPV4_TEXT="${IPV4_ADDRS[*]}"
+IPV6_TEXT="${IPV6_ADDRS[*]}"
 INFO_EOF
 
     print_success "Xray配置完成"
@@ -1434,45 +1848,92 @@ full_install() {
     configure_nginx_service
     create_default_page
     install_acme
-    
+
     # 选择CA机构
     select_ca
-    
+
+    # 选择证书入口模式
+    select_certificate_entry_mode
+
     # 询问域名
     echo ""
     print_info "请输入要配置的域名（多个域名用空格分隔）："
     read -p "> " domains_input
-    IFS=' ' read -ra domains <<< "$domains_input"
-    
-    if [[ ${#domains[@]} -eq 0 ]]; then
+    IFS=' ' read -ra DOMAINS <<< "$domains_input"
+
+    if [[ ${#DOMAINS[@]} -eq 0 ]]; then
         print_error "未输入域名"
         exit 1
     fi
-    
-    # 申请证书
-    for domain in "${domains[@]}"; do
-        apply_certificate "$domain"
+
+    IPV4_ADDRS=()
+    IPV6_ADDRS=()
+
+    case "$CERT_ENTRY_MODE" in
+        domain_ipv6)
+            collect_addresses_for_family "IPv6" IPV6_ADDRS
+            if [[ ${#IPV6_ADDRS[@]} -eq 0 ]]; then
+                print_error "已选择 IPv6 证书模式，但最终 IPv6 地址列表为空"
+                exit 1
+            fi
+            ;;
+        domain_ipv4_ipv6)
+            collect_addresses_for_family "IPv4" IPV4_ADDRS
+            collect_addresses_for_family "IPv6" IPV6_ADDRS
+            if [[ ${#IPV4_ADDRS[@]} -eq 0 ]]; then
+                print_error "已选择 IPv4+IPv6 证书模式，但最终 IPv4 地址列表为空"
+                exit 1
+            fi
+            if [[ ${#IPV6_ADDRS[@]} -eq 0 ]]; then
+                print_error "已选择 IPv4+IPv6 证书模式，但最终 IPv6 地址列表为空"
+                exit 1
+            fi
+            ;;
+    esac
+
+    echo ""
+    print_info "最终入口清单："
+    echo "  域名: ${DOMAINS[*]}"
+    echo "  IPv4: ${IPV4_ADDRS[*]:-<无>}"
+    echo "  IPv6: ${IPV6_ADDRS[*]:-<无>}"
+
+    # 先启动 HTTP-only 配置，确保 webroot HTTP-01 验证可用。
+    configure_nginx_acme_http_only
+
+    # 申请域名证书
+    local domain ip
+    for domain in "${DOMAINS[@]}"; do
+        apply_certificate "$domain" "domain"
     done
-    
-    # 配置Nginx
-    configure_nginx "${domains[@]}"
+
+    # 申请 IP 短证书
+    for ip in "${IPV4_ADDRS[@]}"; do
+        apply_certificate "$ip" "ip"
+    done
+    for ip in "${IPV6_ADDRS[@]}"; do
+        apply_certificate "$ip" "ip"
+    done
+
+    # 配置最终 Nginx
+    configure_nginx
     restart_nginx
-    
+
     # 安装Xray
     install_xray
     configure_xray_service
-    
+
     # 获取路径并配置Xray
-    local path=$(cat /tmp/xray_path.txt)
+    local path
+    path=$(cat /tmp/xray_path.txt)
     configure_xray "$path"
     fix_socket_permissions
     restart_xray
-    
+
     echo ""
     print_success "========================================="
     print_success "安装完成！"
     print_success "========================================="
-    
+
     show_proxy_info
 }
 
@@ -1480,7 +1941,9 @@ full_install() {
 show_proxy_info() {
     local uuid=""
     local path=""
-    local domains_input=""
+    local domains_text=""
+    local ipv4_text=""
+    local ipv6_text=""
 
     # 优先级1: 从临时文件读取（安装后立即显示）
     if [[ -f /tmp/xray_uuid.txt ]]; then
@@ -1491,31 +1954,43 @@ show_proxy_info() {
     fi
 
     # 优先级2: 从持久化配置文件读取
-    if [[ -z "$uuid" ]] || [[ -z "$path" ]]; then
-        if [[ -f /usr/local/etc/xray/install_info.conf ]]; then
-            print_info "从持久化配置读取信息..."
-            source /usr/local/etc/xray/install_info.conf
-            uuid=${UUID:-$uuid}
-            path=${PATH:-$path}
-        fi
+    if [[ -f /usr/local/etc/xray/install_info.conf ]]; then
+        print_info "从持久化配置读取信息..."
+        # 不要 source 该文件：旧版本曾写入 PATH=...，source 会覆盖系统 PATH，导致 cat/grep 等命令找不到。
+        local saved_uuid=""
+        local saved_path=""
+        local saved_domains=""
+        local saved_ipv4=""
+        local saved_ipv6=""
+        saved_uuid=$(grep -E '^UUID=' /usr/local/etc/xray/install_info.conf 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
+        saved_path=$(grep -E '^(XRAY_PATH|PATH)=' /usr/local/etc/xray/install_info.conf 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
+        saved_domains=$(grep -E '^DOMAINS_TEXT=' /usr/local/etc/xray/install_info.conf 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
+        saved_ipv4=$(grep -E '^IPV4_TEXT=' /usr/local/etc/xray/install_info.conf 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
+        saved_ipv6=$(grep -E '^IPV6_TEXT=' /usr/local/etc/xray/install_info.conf 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
+        uuid=${saved_uuid:-$uuid}
+        path=${saved_path:-$path}
+        domains_text=${saved_domains:-$domains_text}
+        ipv4_text=${saved_ipv4:-$ipv4_text}
+        ipv6_text=${saved_ipv6:-$ipv6_text}
     fi
 
     # 优先级3: 从Xray配置文件提取（最可靠）
     if [[ -f $XRAY_CONF ]]; then
         if [[ -z "$uuid" ]]; then
             print_info "从Xray配置文件读取UUID..."
-            # 使用sed提取，更可靠
             uuid=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' $XRAY_CONF | head -n 1)
         fi
 
         if [[ -z "$path" ]]; then
             print_info "从Xray配置文件读取路径..."
-            # xhttpSettings中的path字段
             path=$(sed -n 's/.*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' $XRAY_CONF | head -n 1)
         fi
     fi
 
-    # 如果仍然无法获取信息
+    if [[ -z "$domains_text" && -f $NGINX_CONF ]]; then
+        domains_text=$(grep -oP 'server_name \K[^;]+' $NGINX_CONF | grep -v '^_$' | sort -u | tr '\n' ' ' | xargs)
+    fi
+
     if [[ -z "$uuid" ]] || [[ -z "$path" ]]; then
         print_error "未找到配置信息"
         echo ""
@@ -1542,30 +2017,29 @@ show_proxy_info() {
         return
     fi
 
-    # 获取域名信息
-    if [[ -f $NGINX_CONF ]]; then
-        domains_input=$(grep -oP 'server_name \K[^;]+' $NGINX_CONF | grep -v '_' | head -n 1)
-    fi
+    [[ -z "$domains_text" ]] && domains_text="<未配置域名>"
+    [[ -z "$ipv4_text" ]] && ipv4_text="<无>"
+    [[ -z "$ipv6_text" ]] && ipv6_text="<无>"
 
-    if [[ -z "$domains_input" ]]; then
-        domains_input="<未配置域名>"
-    fi
-    
     echo ""
     echo -e "${GREEN}=========================================${NC}"
     echo -e "${GREEN}代理配置信息${NC}"
     echo -e "${GREEN}=========================================${NC}"
     echo -e "${BLUE}协议:${NC} VLESS"
     echo -e "${BLUE}UUID:${NC} ${uuid}"
-    echo -e "${BLUE}域名:${NC} ${domains_input}"
+    echo -e "${BLUE}域名入口:${NC} ${domains_text}"
+    echo -e "${BLUE}IPv4入口:${NC} ${ipv4_text}"
+    echo -e "${BLUE}IPv6入口:${NC} ${ipv6_text}"
     echo -e "${BLUE}端口:${NC} 443"
     echo -e "${BLUE}传输:${NC} XHTTP"
     echo -e "${BLUE}路径:${NC} ${path}"
     echo -e "${BLUE}TLS:${NC} 启用"
-    
+    echo -e "${BLUE}后端:${NC} unix:${SOCKET_PATH}"
+
     # 显示CA信息
     if [[ -f /tmp/xray_ca.txt ]]; then
-        local ca_server=$(cat /tmp/xray_ca.txt)
+        local ca_server
+        ca_server=$(cat /tmp/xray_ca.txt)
         local ca_display=""
         case $ca_server in
             letsencrypt) ca_display="Let's Encrypt" ;;
@@ -1574,9 +2048,12 @@ show_proxy_info() {
             ssl.com) ca_display="SSL.com" ;;
             *) ca_display="$ca_server" ;;
         esac
-        echo -e "${BLUE}证书CA:${NC} $ca_display"
+        echo -e "${BLUE}域名证书CA:${NC} $ca_display"
+        if [[ "$ipv4_text" != "<无>" || "$ipv6_text" != "<无>" ]]; then
+            echo -e "${BLUE}IP证书CA:${NC} Let's Encrypt shortlived"
+        fi
     fi
-    
+
     echo -e "${GREEN}=========================================${NC}"
     echo ""
 }
@@ -1594,6 +2071,7 @@ partial_uninstall() {
     rm -rf /etc/nginx
     rm -rf /var/log/nginx
     rm -rf /var/www/html
+    rm -rf "$ACME_WEBROOT"
     rm -rf /var/cache/nginx
     rm -f /tmp/xray_*.txt
     rm -rf /usr/local/etc/xray
