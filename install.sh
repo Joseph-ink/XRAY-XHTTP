@@ -32,6 +32,9 @@ ACME_WEBROOT="/var/www/acme"
 DOMAIN_CERT_RENEW_THRESHOLD_DAYS=30
 IP_CERT_RENEW_THRESHOLD_HOURS=72
 IP_CERT_RENEW_DAYS=3
+BRUTAL_NGINX_REPO="https://github.com/sduoduo233/brutal-nginx"
+BRUTAL_NGINX_MODULE_SO="/usr/lib/nginx/modules/ngx_http_tcp_brutal_module.so"
+TCP_BRUTAL_RATE="${TCP_BRUTAL_RATE:-1048576}"  # bytes/s，默认 1 MiB/s，可在运行脚本前通过环境变量覆盖
 DOMAINS=()
 IPV4_ADDRS=()
 IPV6_ADDRS=()
@@ -645,6 +648,10 @@ compile_install_nginx() {
     git submodule update --init --recursive
     cd ..
 
+    # 下载 brutal-nginx 模块；后续通过 --add-dynamic-module 编译，继承同一组 CC_OPT 优化参数。
+    print_info "下载 brutal-nginx 模块..."
+    git clone --depth=1 "$BRUTAL_NGINX_REPO" brutal-nginx
+
     # 获取CPU优化参数
     print_info "配置编译优化参数..."
     local arch=$(uname -m)
@@ -747,6 +754,7 @@ compile_install_nginx() {
         --with-stream_geoip_module=dynamic \
         --with-stream_ssl_preread_module \
         --add-module=$COMPILE_PATH/ngx_brotli \
+        --add-dynamic-module=$COMPILE_PATH/brutal-nginx \
         --with-compat \
         --with-cc-opt="$CC_OPT"
 
@@ -776,6 +784,16 @@ compile_install_nginx() {
         exit 1
     fi
 
+    # 安装 brutal-nginx 动态模块。部分 Nginx 版本不会自动复制外部动态模块，因此这里显式兜底复制。
+    mkdir -p "$(dirname "$BRUTAL_NGINX_MODULE_SO")"
+    if [[ -f objs/ngx_http_tcp_brutal_module.so ]]; then
+        cp -f objs/ngx_http_tcp_brutal_module.so "$BRUTAL_NGINX_MODULE_SO"
+        chmod 644 "$BRUTAL_NGINX_MODULE_SO"
+        print_success "brutal-nginx 模块已安装: $BRUTAL_NGINX_MODULE_SO"
+    else
+        print_warning "未找到 brutal-nginx 动态模块文件: objs/ngx_http_tcp_brutal_module.so"
+    fi
+
     # 清理编译文件
     print_info "清理编译文件..."
     cd /
@@ -795,8 +813,14 @@ compile_install_nginx() {
 # 安装Nginx
 install_nginx() {
     if [[ -x "$NGINX_BIN" ]]; then
-        print_warning "Nginx已安装在目标位置，跳过安装: $NGINX_BIN"
-        systemctl stop nginx 2>/dev/null || true
+        if [[ "$NGINX_INSTALL_METHOD" == "compile" ]] && ! brutal_nginx_module_available; then
+            print_warning "检测到目标位置已有 Nginx，但未检测到 brutal-nginx 模块，将重新源码编译安装"
+            systemctl stop nginx 2>/dev/null || true
+            compile_install_nginx
+        else
+            print_warning "Nginx已安装在目标位置，跳过安装: $NGINX_BIN"
+            systemctl stop nginx 2>/dev/null || true
+        fi
         return
     fi
 
@@ -971,6 +995,48 @@ get_nginx_user() {
         echo "nginx"
     else
         echo "nobody"
+    fi
+}
+
+# 校验 brutal-nginx 速率参数。单位：bytes/s。默认 1048576，即 1 MiB/s。
+validate_tcp_brutal_rate() {
+    if ! [[ "$TCP_BRUTAL_RATE" =~ ^[0-9]+$ ]] || (( TCP_BRUTAL_RATE < 1 )); then
+        print_warning "TCP_BRUTAL_RATE=$TCP_BRUTAL_RATE 非法，已回退为 1048576 bytes/s"
+        TCP_BRUTAL_RATE="1048576"
+    fi
+}
+
+# 检测当前 Nginx 是否具备 brutal-nginx 模块能力。
+# - 动态模块：存在 $BRUTAL_NGINX_MODULE_SO
+# - 静态/已编译记录：nginx -V 中包含 brutal 相关 configure 参数
+brutal_nginx_module_available() {
+    if [[ -f "$BRUTAL_NGINX_MODULE_SO" ]]; then
+        return 0
+    fi
+
+    if [[ -x "$NGINX_BIN" ]] && "$NGINX_BIN" -V 2>&1 | grep -Eq 'brutal-nginx|ngx_http_tcp_brutal|add-dynamic-module=.*brutal|add-module=.*brutal'; then
+        return 0
+    fi
+
+    return 1
+}
+
+# brutal-nginx 以动态模块方式编译时，需要在 nginx.conf 主上下文加载模块。
+write_brutal_load_module_directive() {
+    if [[ -f "$BRUTAL_NGINX_MODULE_SO" ]]; then
+        echo "load_module $BRUTAL_NGINX_MODULE_SO;" >> "$NGINX_CONF"
+        echo "" >> "$NGINX_CONF"
+    fi
+}
+
+# 写入 tcp_brutal 指令。显式写入到每个 server 和 location，避免多域名/多 IP 场景下遗漏。
+write_tcp_brutal_directives() {
+    local indent="${1:-        }"
+
+    validate_tcp_brutal_rate
+    if brutal_nginx_module_available; then
+        echo "${indent}tcp_brutal on;" >> "$NGINX_CONF"
+        echo "${indent}tcp_brutal_rate $TCP_BRUTAL_RATE;" >> "$NGINX_CONF"
     fi
 }
 
@@ -1323,6 +1389,11 @@ worker_processes auto;
 error_log /var/log/nginx/error.log notice;
 pid /run/nginx.pid;
 
+EOF
+
+    write_brutal_load_module_directive
+
+    cat >> "$NGINX_CONF" << EOF
 events {
     worker_connections 1024;
 }
@@ -1333,17 +1404,26 @@ http {
     server_tokens off;
 
     server {
+EOF
+    write_tcp_brutal_directives "        "
+    cat >> "$NGINX_CONF" << EOF
         listen 80 default_server;
         listen [::]:80 default_server;
         server_name _;
 
         location ^~ /.well-known/acme-challenge/ {
+EOF
+    write_tcp_brutal_directives "            "
+    cat >> "$NGINX_CONF" << EOF
             root $ACME_WEBROOT;
             default_type text/plain;
             try_files \$uri =404;
         }
 
         location / {
+EOF
+    write_tcp_brutal_directives "            "
+    cat >> "$NGINX_CONF" << EOF
             root /var/www/html;
             index index.html;
             try_files \$uri \$uri/ =404;
@@ -1368,6 +1448,9 @@ write_common_proxy_locations() {
         keepalive_timeout 5m;
 
         location $random_path {
+LOCATION_BLOCK
+    write_tcp_brutal_directives "            "
+    cat >> "$NGINX_CONF" << LOCATION_BLOCK
             client_max_body_size 0;
             grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
             client_body_timeout 5m;
@@ -1377,6 +1460,9 @@ write_common_proxy_locations() {
         }
 
         location / {
+LOCATION_BLOCK
+    write_tcp_brutal_directives "            "
+    cat >> "$NGINX_CONF" << LOCATION_BLOCK
             try_files \$uri \$uri/ =404;
         }
 LOCATION_BLOCK
@@ -1392,6 +1478,7 @@ write_ip_server_block() {
     cat >> "$NGINX_CONF" << DOMAIN_BLOCK
     server {
 DOMAIN_BLOCK
+    write_tcp_brutal_directives "        "
 
     if [[ "$family" == "ipv6" ]]; then
         cat >> "$NGINX_CONF" << DOMAIN_BLOCK
@@ -1472,6 +1559,7 @@ write_domain_server_block() {
     cat >> "$NGINX_CONF" << DOMAIN_BLOCK
     server {
 DOMAIN_BLOCK
+    write_tcp_brutal_directives "        "
 
     write_domain_listen_directives "$is_first_domain"
 
@@ -1544,6 +1632,11 @@ worker_processes auto;
 error_log /var/log/nginx/error.log notice;
 pid /run/nginx.pid;
 
+NGINX_CONF_START
+
+    write_brutal_load_module_directive
+
+    cat >> "$NGINX_CONF" << NGINX_CONF_START
 events {
     worker_connections 1024;
 }
@@ -1600,17 +1693,26 @@ NGINX_CONF_MIDDLE
 
     cat >> "$NGINX_CONF" << NGINX_CONF_END
     server {
+NGINX_CONF_END
+    write_tcp_brutal_directives "        "
+    cat >> "$NGINX_CONF" << NGINX_CONF_END
         listen 80 default_server;
         listen [::]:80 default_server;
         server_name _;
 
         location ^~ /.well-known/acme-challenge/ {
+NGINX_CONF_END
+    write_tcp_brutal_directives "            "
+    cat >> "$NGINX_CONF" << NGINX_CONF_END
             root $ACME_WEBROOT;
             default_type text/plain;
             try_files \$uri =404;
         }
 
         location / {
+NGINX_CONF_END
+    write_tcp_brutal_directives "            "
+    cat >> "$NGINX_CONF" << NGINX_CONF_END
             return 301 https://\$host\$request_uri;
         }
     }
@@ -1829,6 +1931,7 @@ XRAY_PATH="$path"
 DOMAINS_TEXT="${DOMAINS[*]}"
 IPV4_TEXT="${IPV4_ADDRS[*]}"
 IPV6_TEXT="${IPV6_ADDRS[*]}"
+TCP_BRUTAL_RATE="$TCP_BRUTAL_RATE"
 INFO_EOF
 
     print_success "Xray配置完成"
@@ -1987,6 +2090,7 @@ show_proxy_info() {
     local domains_text=""
     local ipv4_text=""
     local ipv6_text=""
+    local tcp_brutal_rate_text=""
 
     # 优先级1: 从临时文件读取（安装后立即显示）
     if [[ -f /tmp/xray_uuid.txt ]]; then
@@ -2005,16 +2109,19 @@ show_proxy_info() {
         local saved_domains=""
         local saved_ipv4=""
         local saved_ipv6=""
+        local saved_tcp_brutal_rate=""
         saved_uuid=$(grep -E '^UUID=' "$XRAY_INFO" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
         saved_path=$(grep -E '^(XRAY_PATH|PATH)=' "$XRAY_INFO" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
         saved_domains=$(grep -E '^DOMAINS_TEXT=' "$XRAY_INFO" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
         saved_ipv4=$(grep -E '^IPV4_TEXT=' "$XRAY_INFO" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
         saved_ipv6=$(grep -E '^IPV6_TEXT=' "$XRAY_INFO" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
+        saved_tcp_brutal_rate=$(grep -E '^TCP_BRUTAL_RATE=' "$XRAY_INFO" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
         uuid=${saved_uuid:-$uuid}
         path=${saved_path:-$path}
         domains_text=${saved_domains:-$domains_text}
         ipv4_text=${saved_ipv4:-$ipv4_text}
         ipv6_text=${saved_ipv6:-$ipv6_text}
+        tcp_brutal_rate_text=${saved_tcp_brutal_rate:-$tcp_brutal_rate_text}
     fi
 
     # 优先级3: 从Xray配置文件提取（最可靠）
@@ -2063,6 +2170,7 @@ show_proxy_info() {
     [[ -z "$domains_text" ]] && domains_text="<未配置域名>"
     [[ -z "$ipv4_text" ]] && ipv4_text="<无>"
     [[ -z "$ipv6_text" ]] && ipv6_text="<无>"
+    [[ -z "$tcp_brutal_rate_text" ]] && tcp_brutal_rate_text="$TCP_BRUTAL_RATE"
 
     echo ""
     echo -e "${GREEN}=========================================${NC}"
@@ -2080,6 +2188,7 @@ show_proxy_info() {
     echo -e "${BLUE}后端:${NC} unix:${SOCKET_PATH}"
     echo -e "${BLUE}Nginx程序:${NC} ${NGINX_BIN}"
     echo -e "${BLUE}Nginx配置:${NC} ${NGINX_CONF}"
+    echo -e "${BLUE}tcp_brutal_rate:${NC} ${tcp_brutal_rate_text} bytes/s"
     echo -e "${BLUE}Xray程序:${NC} ${XRAY_BIN}"
     echo -e "${BLUE}Xray配置:${NC} ${XRAY_CONF}"
     echo -e "${BLUE}TLS证书目录:${NC} ${CERT_DIR}"
