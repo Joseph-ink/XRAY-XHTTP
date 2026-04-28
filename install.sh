@@ -13,13 +13,17 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 # 配置变量
-NGINX_DIR="/usr/local/nginx"
-NGINX_CONF="/etc/nginx/nginx.conf"
+# 统一安装位置：程序、配置、证书路径集中定义，后续逻辑全部引用这些变量。
+NGINX_DIR="/etc/nginx"
+NGINX_BIN="${NGINX_DIR}/nginx"
+NGINX_CONF="${NGINX_DIR}/nginx.conf"
 NGINX_SERVICE="/etc/systemd/system/nginx.service"
-XRAY_DIR="/usr/local/xray"
-XRAY_CONF="/usr/local/etc/xray/config.json"
+XRAY_DIR="/etc/xray"
+XRAY_BIN="${XRAY_DIR}/xray"
+XRAY_CONF="${XRAY_DIR}/config.json"
+XRAY_INFO="${XRAY_DIR}/install_info.conf"
 XRAY_SERVICE="/etc/systemd/system/xray.service"
-CERT_DIR="/etc/ssl/xray"
+CERT_DIR="/root/cert"
 ACME_SCRIPT="/root/.acme.sh/acme.sh"
 SOCKET_PATH="/dev/shm/xray.socket"
 COMPILE_PATH="/tmp/nginx_compile"
@@ -60,13 +64,38 @@ check_root() {
 # 创建必要目录
 create_directories() {
     print_info "创建必要目录..."
+    mkdir -p "$NGINX_DIR"
     mkdir -p /var/log/nginx
     mkdir -p /var/www/html
-    mkdir -p /usr/local/etc/xray
-    mkdir -p $CERT_DIR
+    mkdir -p "$XRAY_DIR"
+    mkdir -p "$CERT_DIR"
     mkdir -p "$ACME_WEBROOT/.well-known/acme-challenge"
     print_success "目录创建完成"
 }
+
+# 统一 Nginx 程序入口
+# - 源码编译：直接安装到 $NGINX_BIN
+# - 软件源安装：保留包管理器的 /usr/sbin/nginx，并在 $NGINX_BIN 创建符号链接
+ensure_nginx_binary_path() {
+    if [[ -x "$NGINX_BIN" ]]; then
+        return 0
+    fi
+
+    local system_nginx=""
+    system_nginx=$(command -v nginx 2>/dev/null || true)
+    if [[ -z "$system_nginx" && -x /usr/sbin/nginx ]]; then
+        system_nginx="/usr/sbin/nginx"
+    fi
+
+    if [[ -n "$system_nginx" && "$system_nginx" != "$NGINX_BIN" ]]; then
+        mkdir -p "$NGINX_DIR"
+        ln -sf "$system_nginx" "$NGINX_BIN"
+        print_info "已统一 Nginx 程序入口: $NGINX_BIN -> $system_nginx"
+    fi
+
+    [[ -x "$NGINX_BIN" ]]
+}
+
 
 # 选择Nginx安装方式
 select_nginx_install_method() {
@@ -658,7 +687,7 @@ compile_install_nginx() {
 
     # 创建必要的目录
     mkdir -p /var/cache/nginx
-    mkdir -p /etc/nginx/conf.d
+    mkdir -p "$NGINX_DIR/conf.d"
 
     # 进入源码目录并配置
     cd nginx_src
@@ -672,10 +701,10 @@ compile_install_nginx() {
     fi
 
     ./configure \
-        --prefix=/etc/nginx \
-        --sbin-path=/usr/sbin/nginx \
+        --prefix="$NGINX_DIR" \
+        --sbin-path="$NGINX_BIN" \
         --modules-path=/usr/lib/nginx/modules \
-        --conf-path=/etc/nginx/nginx.conf \
+        --conf-path="$NGINX_CONF" \
         --error-log-path=/var/log/nginx/error.log \
         --http-log-path=/var/log/nginx/access.log \
         --pid-path=/var/run/nginx.pid \
@@ -753,8 +782,8 @@ compile_install_nginx() {
     rm -rf $COMPILE_PATH
 
     # 验证安装
-    if nginx -v &>/dev/null; then
-        local installed_version=$(nginx -v 2>&1 | grep -oP 'nginx/\K[0-9.]+')
+    if "$NGINX_BIN" -v &>/dev/null; then
+        local installed_version=$("$NGINX_BIN" -v 2>&1 | grep -oP 'nginx/\K[0-9.]+')
         print_success "Nginx编译安装完成! 版本: $installed_version"
         print_success "安装类型: 静态编译，高性能优化"
     else
@@ -765,17 +794,30 @@ compile_install_nginx() {
 
 # 安装Nginx
 install_nginx() {
-    if command -v nginx &> /dev/null; then
-        print_warning "Nginx已安装，跳过..."
+    if [[ -x "$NGINX_BIN" ]]; then
+        print_warning "Nginx已安装在目标位置，跳过安装: $NGINX_BIN"
+        systemctl stop nginx 2>/dev/null || true
         return
     fi
 
     if [[ "$NGINX_INSTALL_METHOD" == "compile" ]]; then
         compile_install_nginx
     else
-        print_info "从软件源安装Nginx..."
-        apt-get install -y nginx
-        print_success "Nginx安装完成"
+        if command -v nginx &> /dev/null || [[ -x /usr/sbin/nginx ]]; then
+            print_warning "检测到系统已有 Nginx，整理程序入口到目标位置..."
+            ensure_nginx_binary_path || {
+                print_error "无法整理 Nginx 程序入口到: $NGINX_BIN"
+                exit 1
+            }
+        else
+            print_info "从软件源安装Nginx..."
+            apt-get install -y nginx
+            ensure_nginx_binary_path || {
+                print_error "Nginx安装后未找到可执行文件: $NGINX_BIN"
+                exit 1
+            }
+            print_success "Nginx安装完成"
+        fi
     fi
 
     # 停止nginx以便后续配置
@@ -786,10 +828,13 @@ install_nginx() {
 configure_nginx_service() {
     print_info "配置Nginx systemd服务..."
 
-    if [[ "$NGINX_INSTALL_METHOD" == "compile" ]]; then
-        # 编译安装需要创建systemd服务文件
-        print_info "创建Nginx systemd服务文件..."
-        cat > $NGINX_SERVICE << 'EOF'
+    ensure_nginx_binary_path || {
+        print_error "未找到 Nginx 可执行文件: $NGINX_BIN"
+        exit 1
+    }
+
+    # 统一使用自定义 systemd 服务，避免软件源安装和源码编译的 ExecStart 路径不一致。
+    cat > "$NGINX_SERVICE" << EOF
 [Unit]
 Description=The NGINX HTTP and reverse proxy server
 Documentation=https://nginx.org/en/docs/
@@ -798,11 +843,11 @@ Wants=network-online.target
 
 [Service]
 Type=forking
-PIDFile=/var/run/nginx.pid
-ExecStartPre=/usr/sbin/nginx -t
-ExecStart=/usr/sbin/nginx
-ExecReload=/bin/kill -s HUP $MAINPID
-ExecStop=/bin/kill -s QUIT $MAINPID
+PIDFile=/run/nginx.pid
+ExecStartPre=$NGINX_BIN -t -c $NGINX_CONF
+ExecStart=$NGINX_BIN -c $NGINX_CONF
+ExecReload=$NGINX_BIN -s reload -c $NGINX_CONF
+ExecStop=$NGINX_BIN -s quit
 PrivateTmp=true
 Restart=on-failure
 RestartSec=10s
@@ -810,13 +855,11 @@ RestartSec=10s
 [Install]
 WantedBy=multi-user.target
 EOF
-        print_success "Nginx systemd服务文件创建完成"
-    fi
 
     # 重载systemd并启用服务
     systemctl daemon-reload
     systemctl enable nginx.service
-    print_success "Nginx服务配置完成"
+    print_success "Nginx服务配置完成: $NGINX_BIN"
 }
 
 # 创建默认网页
@@ -1248,7 +1291,7 @@ configure_nginx_acme_http_only() {
     local nginx_user
     nginx_user=$(get_nginx_user)
 
-    for path in "/etc/nginx/mime.types" "/usr/share/nginx/mime.types" "/usr/local/nginx/conf/mime.types"; do
+    for path in "$NGINX_DIR/mime.types" "/usr/share/nginx/mime.types"; do
         if [[ -f "$path" ]]; then
             mime_types_path="$path"
             break
@@ -1467,7 +1510,7 @@ configure_nginx() {
     local nginx_user
     nginx_user=$(get_nginx_user)
 
-    for path in "/etc/nginx/mime.types" "/usr/share/nginx/mime.types" "/usr/local/nginx/conf/mime.types"; do
+    for path in "$NGINX_DIR/mime.types" "/usr/share/nginx/mime.types"; do
         if [[ -f "$path" ]]; then
             mime_types_path="$path"
             break
@@ -1580,7 +1623,7 @@ NGINX_CONF_END
 # 验证并重启Nginx
 restart_nginx() {
     print_info "验证Nginx配置..."
-    if nginx -t; then
+    if "$NGINX_BIN" -t -c "$NGINX_CONF"; then
         print_success "Nginx配置验证通过"
         systemctl restart nginx
         print_success "Nginx已重启"
@@ -1669,9 +1712,9 @@ install_xray() {
     print_info "解压Xray..."
     unzip -q -o xray.zip -d xray-tmp
     
-    mkdir -p $XRAY_DIR
-    mv xray-tmp/xray $XRAY_DIR/
-    chmod +x $XRAY_DIR/xray
+    mkdir -p "$XRAY_DIR"
+    mv xray-tmp/xray "$XRAY_BIN"
+    chmod +x "$XRAY_BIN"
     
     rm -rf xray-tmp xray.zip
     
@@ -1682,7 +1725,7 @@ install_xray() {
 configure_xray_service() {
     print_info "配置Xray systemd服务..."
     
-    cat > $XRAY_SERVICE << EOF
+    cat > "$XRAY_SERVICE" << EOF
 [Unit]
 Description=Xray Service
 Documentation=https://github.com/xtls
@@ -1694,7 +1737,7 @@ User=root
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
-ExecStart=$XRAY_DIR/xray run -config /usr/local/etc/xray/config.json
+ExecStart=$XRAY_BIN run -config $XRAY_CONF
 Restart=on-failure
 RestartPreventExitStatus=23
 LimitNPROC=10000
@@ -1711,8 +1754,8 @@ EOF
 
 # 生成UUID
 generate_uuid() {
-    if command -v $XRAY_DIR/xray &> /dev/null; then
-        $XRAY_DIR/xray uuid
+    if [[ -x "$XRAY_BIN" ]]; then
+        "$XRAY_BIN" uuid
     else
         cat /proc/sys/kernel/random/uuid
     fi
@@ -1726,7 +1769,7 @@ configure_xray() {
     local uuid=$(generate_uuid)
     
     print_info "配置Xray..."
-    cat > $XRAY_CONF << EOF
+    cat > "$XRAY_CONF" << EOF
 {
     "log": {
         "loglevel": "warning",
@@ -1778,7 +1821,7 @@ EOF
     echo "$uuid" > /tmp/xray_uuid.txt
 
     # 持久化保存配置信息（供后续查询使用）
-    cat > /usr/local/etc/xray/install_info.conf << INFO_EOF
+    cat > "$XRAY_INFO" << INFO_EOF
 # Xray 安装信息
 # 生成时间: $(date)
 UUID="$uuid"
@@ -1812,7 +1855,7 @@ EOF
 # 验证并重启Xray
 restart_xray() {
     print_info "验证Xray配置..."
-    if $XRAY_DIR/xray -test -config $XRAY_CONF; then
+    if "$XRAY_BIN" -test -config "$XRAY_CONF"; then
         print_success "Xray配置验证通过"
         systemctl restart xray
         sleep 2
@@ -1954,7 +1997,7 @@ show_proxy_info() {
     fi
 
     # 优先级2: 从持久化配置文件读取
-    if [[ -f /usr/local/etc/xray/install_info.conf ]]; then
+    if [[ -f "$XRAY_INFO" ]]; then
         print_info "从持久化配置读取信息..."
         # 不要 source 该文件：旧版本曾写入 PATH=...，source 会覆盖系统 PATH，导致 cat/grep 等命令找不到。
         local saved_uuid=""
@@ -1962,11 +2005,11 @@ show_proxy_info() {
         local saved_domains=""
         local saved_ipv4=""
         local saved_ipv6=""
-        saved_uuid=$(grep -E '^UUID=' /usr/local/etc/xray/install_info.conf 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
-        saved_path=$(grep -E '^(XRAY_PATH|PATH)=' /usr/local/etc/xray/install_info.conf 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
-        saved_domains=$(grep -E '^DOMAINS_TEXT=' /usr/local/etc/xray/install_info.conf 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
-        saved_ipv4=$(grep -E '^IPV4_TEXT=' /usr/local/etc/xray/install_info.conf 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
-        saved_ipv6=$(grep -E '^IPV6_TEXT=' /usr/local/etc/xray/install_info.conf 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
+        saved_uuid=$(grep -E '^UUID=' "$XRAY_INFO" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
+        saved_path=$(grep -E '^(XRAY_PATH|PATH)=' "$XRAY_INFO" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
+        saved_domains=$(grep -E '^DOMAINS_TEXT=' "$XRAY_INFO" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
+        saved_ipv4=$(grep -E '^IPV4_TEXT=' "$XRAY_INFO" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
+        saved_ipv6=$(grep -E '^IPV6_TEXT=' "$XRAY_INFO" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')
         uuid=${saved_uuid:-$uuid}
         path=${saved_path:-$path}
         domains_text=${saved_domains:-$domains_text}
@@ -1975,20 +2018,20 @@ show_proxy_info() {
     fi
 
     # 优先级3: 从Xray配置文件提取（最可靠）
-    if [[ -f $XRAY_CONF ]]; then
+    if [[ -f "$XRAY_CONF" ]]; then
         if [[ -z "$uuid" ]]; then
             print_info "从Xray配置文件读取UUID..."
-            uuid=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' $XRAY_CONF | head -n 1)
+            uuid=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONF" | head -n 1)
         fi
 
         if [[ -z "$path" ]]; then
             print_info "从Xray配置文件读取路径..."
-            path=$(sed -n 's/.*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' $XRAY_CONF | head -n 1)
+            path=$(sed -n 's/.*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONF" | head -n 1)
         fi
     fi
 
-    if [[ -z "$domains_text" && -f $NGINX_CONF ]]; then
-        domains_text=$(grep -oP 'server_name \K[^;]+' $NGINX_CONF | grep -v '^_$' | sort -u | tr '\n' ' ' | xargs)
+    if [[ -z "$domains_text" && -f "$NGINX_CONF" ]]; then
+        domains_text=$(grep -oP 'server_name \K[^;]+' "$NGINX_CONF" | grep -v '^_$' | sort -u | tr '\n' ' ' | xargs)
     fi
 
     if [[ -z "$uuid" ]] || [[ -z "$path" ]]; then
@@ -1996,17 +2039,17 @@ show_proxy_info() {
         echo ""
         print_warning "配置文件状态："
 
-        if [[ -f $XRAY_CONF ]]; then
+        if [[ -f "$XRAY_CONF" ]]; then
             echo "  ✓ Xray配置文件存在: $XRAY_CONF"
             echo "    尝试手动提取UUID:"
-            grep -E '"id"' $XRAY_CONF | head -n 1 || echo "    未找到id字段"
+            grep -E '"id"' "$XRAY_CONF" | head -n 1 || echo "    未找到id字段"
             echo "    尝试手动提取Path:"
-            grep -E '"path"' $XRAY_CONF | head -n 1 || echo "    未找到path字段"
+            grep -E '"path"' "$XRAY_CONF" | head -n 1 || echo "    未找到path字段"
         else
             echo "  ✗ Xray配置文件不存在: $XRAY_CONF"
         fi
 
-        if [[ -f $NGINX_CONF ]]; then
+        if [[ -f "$NGINX_CONF" ]]; then
             echo "  ✓ Nginx配置文件存在: $NGINX_CONF"
         else
             echo "  ✗ Nginx配置文件不存在: $NGINX_CONF"
@@ -2035,6 +2078,11 @@ show_proxy_info() {
     echo -e "${BLUE}路径:${NC} ${path}"
     echo -e "${BLUE}TLS:${NC} 启用"
     echo -e "${BLUE}后端:${NC} unix:${SOCKET_PATH}"
+    echo -e "${BLUE}Nginx程序:${NC} ${NGINX_BIN}"
+    echo -e "${BLUE}Nginx配置:${NC} ${NGINX_CONF}"
+    echo -e "${BLUE}Xray程序:${NC} ${XRAY_BIN}"
+    echo -e "${BLUE}Xray配置:${NC} ${XRAY_CONF}"
+    echo -e "${BLUE}TLS证书目录:${NC} ${CERT_DIR}"
 
     # 显示CA信息
     if [[ -f /tmp/xray_ca.txt ]]; then
@@ -2065,21 +2113,25 @@ partial_uninstall() {
     systemctl stop xray nginx 2>/dev/null || true
     systemctl disable xray nginx 2>/dev/null || true
 
-    rm -rf $XRAY_DIR
-    rm -f $XRAY_SERVICE
+    rm -rf "$XRAY_DIR"
+    rm -f "$XRAY_SERVICE"
+    rm -rf "$NGINX_DIR"
     rm -rf /usr/local/nginx
-    rm -rf /etc/nginx
     rm -rf /var/log/nginx
     rm -rf /var/www/html
     rm -rf "$ACME_WEBROOT"
     rm -rf /var/cache/nginx
     rm -f /tmp/xray_*.txt
     rm -rf /usr/local/etc/xray
+    rm -rf /usr/local/xray
     rm -rf /var/log/xray
 
-    # 删除nginx可执行文件（编译安装）
-    rm -f /usr/sbin/nginx
-    rm -f $NGINX_SERVICE
+    # 删除nginx可执行文件（编译安装或目标入口）
+    rm -f "$NGINX_BIN"
+    if ! dpkg -S /usr/sbin/nginx >/dev/null 2>&1; then
+        rm -f /usr/sbin/nginx
+    fi
+    rm -f "$NGINX_SERVICE"
     rm -rf /usr/lib/nginx
 
     # 卸载nginx软件包（软件源安装）
@@ -2099,7 +2151,7 @@ full_uninstall() {
     
     rm -rf /root/.acme.sh
     rm -f /usr/local/bin/acme.sh
-    rm -rf $CERT_DIR
+    rm -rf "$CERT_DIR"
     
     print_success "完全卸载完成"
 }
