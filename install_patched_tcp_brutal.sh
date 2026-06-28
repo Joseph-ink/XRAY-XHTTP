@@ -632,7 +632,7 @@ compile_install_nginx() {
     cd $COMPILE_PATH
 
     # 使用最新的主线版本nginx
-    local NGINX_VERSION="1.30.0"  # Nginx最新主线版
+    local NGINX_VERSION="1.31.2"  # Nginx最新主线版
     print_info "使用Nginx版本: $NGINX_VERSION (主线版)"
 
     # 下载nginx源码
